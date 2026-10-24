@@ -51,7 +51,13 @@ authentic-self/
 
 ## 开发下一步
 
-前置：`pnpm install` → `pnpm run build:artifacts`（首次较久），并准备可用的 `DEEPSEEK_API_KEY`。
+**环境（必读）**：dsh 要求 Node ≥ 24.9，但本机默认 `node` 是 v22。Node 24.15 在 `/e/Scoop/apps/nodejs-lts/current/`，跑任何 pnpm 命令前先：
+
+```sh
+export PATH="/e/Scoop/apps/nodejs-lts/current:$PATH"
+```
+
+前置：`pnpm install`（首次约 20 分钟）→ `pnpm run build:artifacts`，并准备可用的 `DEEPSEEK_API_KEY`。
 
 然后按 [03-p0-plan.md](docs/03-p0-plan.md) 执行 T1 → T2。**T2 是唯一的硬门槛**：它不过，后面的设计全部作废。
 

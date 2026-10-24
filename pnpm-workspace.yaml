@@ -1,6 +1,10 @@
 packages:
   - vendor/*
   - packages/*/*
+  # AuthenticSelf: self infrastructure built beside the harness. Deliberately
+  # outside packages/ so it does not inherit the package-tier gates.
+  - authentic-self/packages/*
+  - authentic-self/bundle
   # The Landlock launcher is developed with its harness consumers but keeps
   # its native build and publication scripts under native/system.
   - native/system

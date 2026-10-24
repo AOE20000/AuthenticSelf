@@ -1,0 +1,24 @@
+# AuthenticSelf 组合层。作为独立补丁层插入，必须排在 `@deepseek-ai/dsh-base` 之后：
+# 本行依赖 base 提供的 sessions / llm / tools 三组服务。
+#
+# 补丁语义（见 docs/architecture.md「Profiles and bundles」）：
+#   空 entry 列表 ← 各 bundle 补丁 ← profile 补丁 ← home 补丁 ← --patch
+# 因此这里插入的每一行都能被 profile 或命令行覆盖，不需要改源码。
+#
+# P0 只挂 core（惰性，不注册服务）。后续每期按依赖顺序追加：
+#   core → store → archive → recall → inject → forget
+#   → reflex → self → tools → commands
+
+- insert:
+    - id: as-core
+      name: '@authentic-self/core'
+
+    # 上行注入。默认关闭，保证「关掉即回到基线」。
+    # 补丁替换整行 config（不合并），所以实验时在 profile 的 cordis.patch.yml 里
+    # 重新声明这一行的完整 config 即可，不必改这里。
+    - id: as-inject
+      name: '@authentic-self/inject'
+      config:
+        enabled: false
+        maxRecallsPerTurn: 1
+        memories: []
