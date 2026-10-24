@@ -78,7 +78,10 @@ export const Config: z<Config> = z.object({
 })
 
 /** 取本次 turn 最后一条 assistant 消息里的推理文本；没有推理时退回过正文。 */
-function readCue(agent: Agent, turn: number): { text: string; cue: 'reasoning' | 'fallback' } | undefined {
+function readCue(
+  agent: Agent,
+  turn: number,
+): { text: string; cue: 'reasoning' | 'fallback'; step: number } | undefined {
   for (let seq = agent.session.seq - 1; seq >= 0; seq -= 1) {
     const event = agent.session.eventAt(SessionSeq(seq))
     if (event?.type !== 'assistant/message') continue
@@ -89,13 +92,13 @@ function readCue(agent: Agent, turn: number): { text: string; cue: 'reasoning' |
       .map(block => block.text)
       .join('\n')
       .trim()
-    if (reasoning.length > 0) return { text: reasoning, cue: 'reasoning' }
+    if (reasoning.length > 0) return { text: reasoning, cue: 'reasoning', step: event.data.step }
     const text = blocks
       .filter(block => block.type === 'text')
       .map(block => block.text)
       .join('\n')
       .trim()
-    return text.length > 0 ? { text, cue: 'fallback' } : undefined
+    return text.length > 0 ? { text, cue: 'fallback', step: event.data.step } : undefined
   }
   return undefined
 }
@@ -123,11 +126,19 @@ function pick(seed: readonly SeedMemory[], cue: string, limit: number): SeedMemo
   return scored.slice(0, limit).map(entry => entry.memory)
 }
 
-/** 渲染注入片段：必须自带来源、时间与"非当前感知"的声明。 */
+/**
+ * 渲染注入片段。
+ *
+ * 措辞是这段代码里最要紧的部分：注入以 `user` 角色落地，且排在助手已给出回答之后，
+ * 若不明确声明"不是新请求"，模型会把记忆本身当成用户的新问题去回应——
+ * 第一次实测就是这样，它开始评论"用户粘贴了一段记忆"。
+ */
 function render(memories: readonly SeedMemory[]): string {
   const lines = memories.map(memory =>
     `[记忆｜${memory.at ?? '时间未知'}｜来源:用户｜置信:高] ${memory.text}`)
-  return '以下是从长期记忆中浮现的内容，不是你当前的直接感知。引用时请说明依据与时间。\n\n'
+  return '以下是系统从长期记忆中浮现的背景信息，不是你当前的直接感知，也不是用户的新请求。\n'
+    + '若它补充或修正了你刚才的回答，用一两句话说明修正即可；'
+    + '若与当前任务无关，直接忽略，不要复述或评论这些记忆本身。\n\n'
     + lines.join('\n')
 }
 
@@ -157,7 +168,7 @@ export function apply(ctx: Context, config: Config): void {
     const text = render(picked)
     agent.session.append('as/injection', {
       turn,
-      step: agent.session.seq,
+      step: cue.step,
       ids: picked.map(memory => memory.id),
       cue: cue.cue,
     })
