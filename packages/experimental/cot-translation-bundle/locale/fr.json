@@ -1,7 +1,0 @@
-{
-  "meta": {
-    "title": "Traduction automatique du raisonnement",
-    "description": "Traduction automatique d'un raisonnement élargi ; le texte source est envoyé au service sélectionné.",
-    "detail": "docs/DETAIL.md"
-  }
-}

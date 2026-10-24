@@ -1,22 +1,11 @@
 packages:
   - vendor/*
   - packages/*/*
-  # AuthenticSelf: self infrastructure built beside the harness. Deliberately
-  # outside packages/ so it does not inherit the package-tier gates.
+  # AuthenticSelf: self infrastructure built beside the frontend.
   - authentic-self/packages/*
   - authentic-self/bundle
-  # The Landlock launcher is developed with its harness consumers but keeps
-  # its native build and publication scripts under native/system.
-  - native/system
-  - native/system/packages/*
-  # Product assemblies over the package tier; apps/cli owns the `dsh` bin.
+  # Frontend application (apps/web).
   - apps/*
-  # Private package owning repository-level benchmark dependencies.
-  - benchmarks
-  - website
-  # Deploy root of the single-exe build: a pure dependency manifest whose
-  # closure is what the exe bundles and what the Python runtime distributes.
-  - python/sdk-runtime
 
 overrides:
   'extract-zip>yauzl': '3.4.0'
