@@ -510,7 +510,7 @@ all/2026/03/w10/12/14 → 具体片段
 | reasoning 触发源 | session 的 `ReasoningBlock` | 否 |
 | 工具注册（两个原语） | `ctx.tools.register(defineTool(...))` | 否 |
 | 人侧命令 | `ctx.commands` | 否 |
-| 记忆持久化 | `ctx.storage` + `ctx.storageDomain`（SQLite 后端） | 否 |
+| 记忆持久化 | `node:sqlite`（`DatabaseSync`）直接落 SQLite 单文件，路径 `$DSH_HOME/authentic-self/memory.db` | 否 |
 | 归档检索 | 自建 domain + 时间桶索引 | 否 |
 | 上下文剔除 | `ctx.sessions.registerMessageProjection()` + 中止重发 | 否（**已验证**） |
 | profile 隔离 | `$DSH_HOME/profiles/<name>/` | 否 |
