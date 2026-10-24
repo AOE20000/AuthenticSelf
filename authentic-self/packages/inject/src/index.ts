@@ -80,7 +80,6 @@ export const Config: z<Config> = z.object({
 /** 取本次 turn 最后一条 assistant 消息里的推理文本；没有推理时退回过正文。 */
 function readCue(agent: Agent, turn: number): { text: string; cue: 'reasoning' | 'fallback' } | undefined {
   for (let seq = agent.session.seq - 1; seq >= 0; seq -= 1) {
-    // oxlint-disable-next-line typescript/no-deprecated -- 既有历史读取路径；迁移另行安排。
     const event = agent.session.eventAt(SessionSeq(seq))
     if (event?.type !== 'assistant/message') continue
     if (event.data.turn !== turn) continue
