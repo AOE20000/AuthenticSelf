@@ -2,8 +2,7 @@
  * AuthenticSelf 的公共类型面与插件入口。
  *
  * P0 阶段这是一个惰性插件：只证明组合层能把它挂起来，不注册任何服务。
- * `ctx.authenticSelf` 的服务定义等 store 落地后再加——先声明会诱导其他包
- * 依赖一个还不存在的契约。
+ * 服务由 `@authentic-self/store` 提供，契约定义在本包的 `service.ts`。
  *
  * @module @authentic-self/core
  */
@@ -11,6 +10,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 
 export type * from './types.ts'
+export type * from './service.ts'
 
 /** Cordis 插件名，用于 loader 诊断与配置行定位。 */
 export const name = 'authentic-self-core'
@@ -22,7 +22,7 @@ export const name = 'authentic-self-core'
 export const inject = ['sessions', 'llm', 'tools']
 
 /**
- * 惰性激活：P0 不注册服务、不读写状态，只确认依赖齐备。
+ * 惰性激活：不注册服务、不读写状态，只确认依赖齐备。
  * @param ctx - 插件上下文，随插件卸载一并回收。
  */
 export function apply(ctx: Context): void {

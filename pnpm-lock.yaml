@@ -1100,6 +1100,22 @@ importers:
         specifier: workspace:*
         version: link:../../../packages/core/session
 
+  authentic-self/packages/store:
+    dependencies:
+      '@authentic-self/core':
+        specifier: workspace:*
+        version: link:../core
+      '@deepseek-ai/schemastery':
+        specifier: link:../../../vendor/schemastery
+        version: link:../../../vendor/schemastery
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: workspace:~
+        version: link:../../../vendor/cordis
+      '@deepseek-ai/dsh-session':
+        specifier: workspace:*
+        version: link:../../../packages/core/session
+
   benchmarks:
     devDependencies:
       '@deepseek-ai/cordis':

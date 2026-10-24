@@ -1,5 +1,5 @@
 /**
- * AuthenticSelf 上行注入（P0 最小实现）。
+ * AuthenticSelf 上行注入（P0/P1）。
  *
  * 机制：一次 step 结束后，若既没有工具调用也没有新输入，agent-loop 会广播
  * `agent/turn-stopping`；广播后它会**再次复查** inbox 的 next-step 队列，
@@ -8,8 +8,8 @@
  * 注入 → 再思考」所需的落点，且 `agent/turn-stopping` 是 serial（串行 await），
  * 天然满足「必须等实时旁路结束」。
  *
- * P0 只做三件事：读推理内容、按关键词挑 1–2 条预置记忆、注入并记审计。
- * 检索、重排、预算与旁路裁决留给后续包。
+ * 记忆来自 `ctx.authenticSelf`（纯进程内存，不落盘）。本插件只负责
+ * "读线索 → 取候选 → 渲染 → 注入 → 记审计"，检索与存储都在 store 里。
  *
  * @module @authentic-self/inject
  */
@@ -20,6 +20,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import { SessionSeq } from '@deepseek-ai/dsh-session'
+import type { MemoryEntry } from '@authentic-self/core'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -42,17 +43,16 @@ declare module '@deepseek-ai/dsh-session/types' {
 /** Cordis 插件名，用于 loader 诊断与配置行定位。 */
 export const name = 'authentic-self-inject'
 
-/** 只依赖 agent 注册表；消息构造与事件类型都是纯类型引用。 */
-export const inject = ['agents']
+/** 依赖 agent 注册表与记忆库服务。 */
+export const inject = ['agents', 'authenticSelf']
 
 /** 注入消息的来源标识，与 `MessageSourceMap` 的声明键一致。 */
 const SOURCE = 'authentic-self'
 
-/** 一条预置记忆。P0 不做存储，直接从配置读。 */
+/** 一条预置记忆。用于首轮播种；日常写入走下行旁路。 */
 interface SeedMemory {
   id: string
   text: string
-  /** 展示给模型的时间标签，参与"引用时说明时间"的提示。 */
   at?: string
 }
 
@@ -62,7 +62,7 @@ export interface Config {
   enabled: boolean
   /** 每个 turn 最多续几次。硬上限，防止无限自我续命。 */
   maxRecallsPerTurn: number
-  /** 预置记忆。P0 用它替代检索层。 */
+  /** 预置记忆。库为空时播种，之后由下行写入接管。 */
   memories: SeedMemory[]
 }
 
@@ -103,27 +103,10 @@ function readCue(
   return undefined
 }
 
-/** 字符二元组集合，用于无依赖的粗粒度相关度。 */
-function bigrams(text: string): Set<string> {
-  const normalized = text.replace(/\s+/gu, '')
-  const out = new Set<string>()
-  for (let i = 0; i + 1 < normalized.length; i += 1) out.add(normalized.slice(i, i + 2))
-  return out
-}
-
-/** 按二元组重叠挑最多两条；零重叠的一律不选，不为了凑数注入噪声。 */
-function pick(seed: readonly SeedMemory[], cue: string, limit: number): SeedMemory[] {
-  const cueGrams = bigrams(cue)
-  const scored = seed
-    .map(memory => {
-      const grams = bigrams(`${memory.text}${memory.id}`)
-      let hits = 0
-      for (const gram of grams) if (cueGrams.has(gram)) hits += 1
-      return { memory, hits }
-    })
-    .filter(entry => entry.hits > 0)
-    .sort((left, right) => right.hits - left.hits)
-  return scored.slice(0, limit).map(entry => entry.memory)
+/** 把时间戳渲染成日期标签；无有效时间时返回「时间未知」。 */
+function dateLabel(at: number): string {
+  if (!Number.isFinite(at) || at <= 0) return '时间未知'
+  return new Date(at).toISOString().slice(0, 10)
 }
 
 /**
@@ -133,9 +116,9 @@ function pick(seed: readonly SeedMemory[], cue: string, limit: number): SeedMemo
  * 若不明确声明"不是新请求"，模型会把记忆本身当成用户的新问题去回应——
  * 第一次实测就是这样，它开始评论"用户粘贴了一段记忆"。
  */
-function render(memories: readonly SeedMemory[]): string {
-  const lines = memories.map(memory =>
-    `[记忆｜${memory.at ?? '时间未知'}｜来源:用户｜置信:高] ${memory.text}`)
+function render(memories: readonly MemoryEntry[]): string {
+  const lines = memories.map(entry =>
+    `[记忆｜${dateLabel(entry.t.start)}｜来源:${entry.source.origin}｜置信:${entry.confidence >= 0.7 ? '高' : '中'}] ${entry.text}`)
   return '以下是系统从长期记忆中浮现的背景信息，不是你当前的直接感知，也不是用户的新请求。\n'
     + '若它补充或修正了你刚才的回答，用一两句话说明修正即可；'
     + '若与当前任务无关，直接忽略，不要复述或评论这些记忆本身。\n\n'
@@ -143,11 +126,32 @@ function render(memories: readonly SeedMemory[]): string {
 }
 
 /**
+ * 播种：库为空时把配置里的种子写进库。库一旦有内容就不再播种，
+ * 避免热重载时把已抑制的条目重新灌回去。
+ * @param ctx - 携带 `authenticSelf` 服务的插件上下文。
+ * @param seeds - 配置里的种子条目。
+ */
+function seedIfEmpty(ctx: Context, seeds: readonly SeedMemory[]): void {
+  if (seeds.length === 0 || ctx.authenticSelf.list().length > 0) return
+  for (const seed of seeds) {
+    const start = seed.at === undefined ? Date.now() : Date.parse(seed.at)
+    ctx.authenticSelf.add({
+      text: seed.text,
+      origin: 'user',
+      t: { start: Number.isFinite(start) ? start : Date.now() },
+      salience: 0.8,
+    })
+  }
+}
+
+/**
  * 注册 turn-stopping 监听器。
  * @param ctx - 插件上下文，监听器随插件卸载一并回收。
- * @param config - 开关、续步上限与预置记忆。
+ * @param config - 开关、续步上限与种子记忆。
  */
 export function apply(ctx: Context, config: Config): void {
+  seedIfEmpty(ctx, config.memories)
+
   /** `${agentId}:${turn}` → 已续步次数。turn 结束即失效，无需持久化。 */
   const recalls = new Map<string, number>()
 
@@ -159,7 +163,7 @@ export function apply(ctx: Context, config: Config): void {
 
     const cue = readCue(agent, turn)
     if (cue === undefined) return
-    const picked = pick(config.memories, cue.text, 2)
+    const picked = ctx.authenticSelf.recall(cue.text, 2)
     if (picked.length === 0) return
 
     recalls.set(key, used + 1)
@@ -169,7 +173,7 @@ export function apply(ctx: Context, config: Config): void {
     agent.session.append('as/injection', {
       turn,
       step: cue.step,
-      ids: picked.map(memory => memory.id),
+      ids: picked.map(entry => entry.id),
       cue: cue.cue,
     })
     agent.inject(createUserMessage({

@@ -13,6 +13,10 @@
     - id: as-core
       name: '@authentic-self/core'
 
+    # 记忆库：纯进程内存，不落盘。模型没有可读路径，黑盒才是边界。
+    - id: as-store
+      name: '@authentic-self/store'
+
     # 上行注入。默认关闭，保证「关掉即回到基线」。
     # 补丁替换整行 config（不合并），所以实验时在 profile 的 cordis.patch.yml 里
     # 重新声明这一行的完整 config 即可，不必改这里。
