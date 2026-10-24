@@ -34,6 +34,8 @@ declare module '@deepseek-ai/dsh-session/types' {
     'as/injection': {
       turn: number
       step: number
+      /** 本 turn 内的第几轮注入，从 1 开始。 */
+      round: number
       ids: string[]
       cue: 'reasoning' | 'fallback'
     }
@@ -60,8 +62,15 @@ interface SeedMemory {
 export interface Config {
   /** 是否启用注入。默认 false。 */
   enabled: boolean
-  /** 每个 turn 最多续几次。硬上限，防止无限自我续命。 */
+  /**
+   * 每个 turn 最多注入几次（= 最多续几步）。
+   *
+   * 一句话的回应里允许「思考 → 注入 → 再思考 → 再注入」，但必须有硬上限：
+   * 没有上限的自我续命会一直跑下去。
+   */
   maxRecallsPerTurn: number
+  /** 单次最多注入几条；其余留给下一轮（本轮已注入过的不会再出现）。 */
+  maxPerRecall: number
   /** 预置记忆。库为空时播种，之后由下行写入接管。 */
   memories: SeedMemory[]
 }
@@ -69,7 +78,8 @@ export interface Config {
 /** Schemastery 校验：字段缺失时取安全默认值。 */
 export const Config: z<Config> = z.object({
   enabled: z.boolean().default(false),
-  maxRecallsPerTurn: z.number().default(1),
+  maxRecallsPerTurn: z.number().default(3),
+  maxPerRecall: z.number().default(2),
   memories: z.array(z.object({
     id: z.string().required(),
     text: z.string().required(),
@@ -112,16 +122,23 @@ function dateLabel(at: number): string {
 /**
  * 渲染注入片段。
  *
- * 措辞是这段代码里最要紧的部分：注入以 `user` 角色落地，且排在助手已给出回答之后，
- * 若不明确声明"不是新请求"，模型会把记忆本身当成用户的新问题去回应——
- * 第一次实测就是这样，它开始评论"用户粘贴了一段记忆"。
+ * 两处措辞是这段代码里最要紧的部分：
+ * 1. 注入以 `user` 角色落地且排在助手已给出回答之后，若不声明"不是新请求"，
+ *    模型会把记忆本身当成用户的新问题去回应（第一次实测就是这样）。
+ * 2. 第 2 轮以后必须要求"并入原答案"。同一句话的回应里会有多轮注入，
+ *    若仍按"用一两句话说明修正"处理，模型会把补充当成独立问题单独作答，
+ *    把前面已经答好的内容丢掉——实测第二轮就出现了这个问题。
  */
-function render(memories: readonly MemoryEntry[]): string {
+function render(memories: readonly MemoryEntry[], round: number): string {
   const lines = memories.map(entry =>
     `[记忆｜${dateLabel(entry.t.start)}｜来源:${entry.source.origin}｜置信:${entry.confidence >= 0.7 ? '高' : '中'}] ${entry.text}`)
+  const instruction = round === 1
+    ? '若它补充或修正了你刚才的回答，用一两句话说明修正即可；'
+      + '若与当前任务无关，直接忽略，不要复述或评论这些记忆本身。'
+    : '这些是对同一问题的追加补充。请把它们并入你已有的回答，必要时重述完整结论；'
+      + '不要把这些记忆当成新的提问，也不要丢掉先前答好的部分。'
   return '以下是系统从长期记忆中浮现的背景信息，不是你当前的直接感知，也不是用户的新请求。\n'
-    + '若它补充或修正了你刚才的回答，用一两句话说明修正即可；'
-    + '若与当前任务无关，直接忽略，不要复述或评论这些记忆本身。\n\n'
+    + `${instruction}\n\n`
     + lines.join('\n')
 }
 
@@ -152,27 +169,43 @@ function seedIfEmpty(ctx: Context, seeds: readonly SeedMemory[]): void {
 export function apply(ctx: Context, config: Config): void {
   seedIfEmpty(ctx, config.memories)
 
-  /** `${agentId}:${turn}` → 已续步次数。turn 结束即失效，无需持久化。 */
-  const recalls = new Map<string, number>()
+  /**
+   * `${agentId}:${turn}` → 本轮已注入的次数与条目。
+   *
+   * 记 ids 是这套机制的关键：一句话的回应里会有多轮「思考 → 旁路」，
+   * 第二轮必须知道"原神已经注入过了，跳过"，否则同一段记忆会被反复塞进上下文。
+   */
+  const turnState = new Map<string, { rounds: number; ids: Set<string> }>()
 
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
     if (!config.enabled || signal.aborted) return
     const key = `${agent.id}:${turn}`
-    const used = recalls.get(key) ?? 0
-    if (used >= config.maxRecallsPerTurn) return
+    let state = turnState.get(key)
+    if (state === undefined) {
+      state = { rounds: 0, ids: new Set<string>() }
+      turnState.set(key, state)
+    }
+    if (state.rounds >= config.maxRecallsPerTurn) return
 
     const cue = readCue(agent, turn)
     if (cue === undefined) return
-    const picked = ctx.authenticSelf.recall(cue.text, 2)
+
+    // 多取一些，再把本轮已注入的滤掉——滤空就不注入，让 turn 自然结束。
+    const candidates = ctx.authenticSelf.recall(cue.text, config.maxPerRecall + state.ids.size)
+    const picked = candidates
+      .filter(entry => !state.ids.has(entry.id))
+      .slice(0, config.maxPerRecall)
     if (picked.length === 0) return
 
-    recalls.set(key, used + 1)
-    if (recalls.size > 256) recalls.clear()
+    state.rounds += 1
+    for (const entry of picked) state.ids.add(entry.id)
+    if (turnState.size > 256) turnState.clear()
 
-    const text = render(picked)
+    const text = render(picked, state.rounds)
     agent.session.append('as/injection', {
       turn,
       step: cue.step,
+      round: state.rounds,
       ids: picked.map(entry => entry.id),
       cue: cue.cue,
     })

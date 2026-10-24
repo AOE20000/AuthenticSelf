@@ -24,5 +24,6 @@
       name: '@authentic-self/inject'
       config:
         enabled: false
-        maxRecallsPerTurn: 1
+        maxRecallsPerTurn: 3
+        maxPerRecall: 2
         memories: []
