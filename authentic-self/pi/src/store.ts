@@ -15,6 +15,17 @@ import { homedir } from 'node:os'
 /** 超过这个字符数即判为长条目；注入时优先给短条目让位。 */
 const LONG_THRESHOLD = 180
 
+/** 记忆条目可能是这四种状态之一。 */
+export type EntryState = 'active' | 'merged' | 'superseded' | 'suppressed'
+
+/** 时近半衰期（天）。参照 Generative Agents 的指数衰减，但以天为单位。 */
+const RECENCY_HALF_LIFE_DAYS = 7
+
+/** 三因子权重。三者归一后等权相加——照 Generative Agents 的做法。 */
+const W_RECENCY = 1
+const W_SALIENCE = 1
+const W_RELEVANCE = 1
+
 /** 各来源的可信度上限。模型自述不得高于用户。 */
 const TRUST_BY_ORIGIN: Record<string, number> = {
   user: 0.9,
@@ -38,6 +49,7 @@ CREATE TABLE IF NOT EXISTS memory_entry (
   salience     REAL NOT NULL DEFAULT 0.5,
   confidence   REAL NOT NULL DEFAULT 0.7,
   state        TEXT NOT NULL DEFAULT 'active',
+  replaced_by  TEXT,
   pinned       INTEGER NOT NULL DEFAULT 0,
   use_count    INTEGER NOT NULL DEFAULT 0
 );
@@ -55,6 +67,8 @@ export interface MemoryEntry {
   salience: number
   confidence: number
   state: string
+  /** 被哪一条取代（merged / superseded 时有值）。 */
+  replacedBy?: string
   pinned: boolean
 }
 
@@ -84,6 +98,7 @@ interface Row {
   salience: number
   confidence: number
   state: string
+  replaced_by: string | null
   pinned: number
 }
 
@@ -99,6 +114,7 @@ function toEntry(row: Row): MemoryEntry {
     salience: row.salience,
     confidence: row.confidence,
     state: row.state,
+    ...row.replaced_by === null ? {} : { replacedBy: row.replaced_by },
     pinned: row.pinned === 1,
   }
 }
@@ -113,6 +129,11 @@ export class Store {
     this.db = new DatabaseSync(file)
     this.db.exec('PRAGMA journal_mode = WAL')
     this.db.exec(DDL)
+    // 旧库迁移：v1 没有 replaced_by
+    const columns = this.db.prepare('PRAGMA table_info(memory_entry)').all() as unknown as { name: string }[]
+    if (!columns.some(column => column.name === 'replaced_by')) {
+      this.db.exec('ALTER TABLE memory_entry ADD COLUMN replaced_by TEXT')
+    }
     this.file = file
   }
 
@@ -197,15 +218,31 @@ export class Store {
   }
 
   /**
-   * 按线索检索。零重叠不返回——不为了凑数注入噪声。
-   * @param cue - 触发线索，通常是本步的推理或正文。
+   * 按线索检索。
+   *
+   * 三因子打分：**时近 + 显著 + 相关**，三者等权相加——照 Generative Agents 的做法。
+   * 只用相关一维会永远返回同几条；只用时近会忘掉重要的。
+   *
+   * 硬规则：零重叠一律不返回。分数再高也不拿无关记忆凑数。
+   * @param cue - 触发线索。
    * @param limit - 最多返回几条。
-   * @param exclude - 本句已注入过的 id，避免同一段记忆反复出现。
+   * @param exclude - 本句已注入过的 id。
+   * @param options - `latestOnly` 为真时只返回 active（滤掉被取代的旧事实）。
    */
-  recall(cue: string, limit: number, exclude: ReadonlySet<string> = new Set()): MemoryEntry[] {
+  recall(
+    cue: string,
+    limit: number,
+    exclude: ReadonlySet<string> = new Set(),
+    options: { latestOnly?: boolean } = {},
+  ): MemoryEntry[] {
     const grams = bigrams(cue)
-    const rows = this.db.prepare("SELECT * FROM memory_entry WHERE state = 'active'").all() as unknown as Row[]
-    return rows
+    const scope = options.latestOnly === true
+      ? "state = 'active'"
+      : "state IN ('active', 'superseded')"
+    const rows = this.db.prepare(`SELECT * FROM memory_entry WHERE ${scope}`).all() as unknown as Row[]
+    const now = Date.now()
+
+    const candidates = rows
       .filter(row => !exclude.has(row.id))
       .map(row => {
         let hits = 0
@@ -213,9 +250,52 @@ export class Store {
         return { row, hits }
       })
       .filter(item => item.hits > 0)
-      .sort((left, right) => right.hits - left.hits)
+
+    if (candidates.length === 0) return []
+    const maxHits = Math.max(...candidates.map(item => item.hits))
+
+    return candidates
+      .map(({ row, hits }) => {
+        const relevance = hits / maxHits
+        const ageDays = Math.max(0, (now - row.t_start) / 86_400_000)
+        const recency = Math.exp(-ageDays / RECENCY_HALF_LIFE_DAYS)
+        const score = W_RECENCY * recency + W_SALIENCE * row.salience + W_RELEVANCE * relevance
+        return { row, score }
+      })
+      .sort((left, right) => right.score - left.score)
       .slice(0, limit)
       .map(item => toEntry(item.row))
+  }
+
+  /**
+   * 取代：旧条目被更新的事实替换。
+   *
+   * 旧条目**不删除**，标 `superseded` 并指向新条目；默认检索仍返回它（历史常有用），
+   * 需要只要当前事实时用 `latestOnly`。
+   * @param oldId - 被取代的条目。
+   * @param newId - 取代它的条目。
+   * @returns 是否命中。
+   */
+  supersede(oldId: string, newId: string): boolean {
+    const result = this.db
+      .prepare("UPDATE memory_entry SET state = 'superseded', replaced_by = ? WHERE id = ? AND state = 'active'")
+      .run(newId, oldId)
+    return Number(result.changes) > 0
+  }
+
+  /**
+   * 合并：旧条目被更完整的新条目吸收。
+   *
+   * 与 supersede 的区别是**默认不再检索**——它的信息已被新条目完全包含。
+   * @param oldId - 被吸收的条目。
+   * @param newId - 吸收它的条目。
+   * @returns 是否命中。
+   */
+  merge(oldId: string, newId: string): boolean {
+    const result = this.db
+      .prepare("UPDATE memory_entry SET state = 'merged', replaced_by = ? WHERE id = ? AND state = 'active'")
+      .run(newId, oldId)
+    return Number(result.changes) > 0
   }
 
   /** 关闭连接。 */

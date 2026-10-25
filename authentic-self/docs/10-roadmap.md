@@ -18,7 +18,7 @@
 
 ---
 
-## M0 先补两处短板（预计最小，收益立刻可见）
+## M0 先补两处短板 ✅ 已完成（2026-10-25）
 
 ### M0.1 检索改成三因子
 
@@ -32,7 +32,7 @@ score = w_rec·recency + w_sal·salience + w_rel·重叠度
 - salience：已有字段，写入时定
 - 三者 min-max 归一后加权
 
-**验收**：同一条线索下，一条"很相关但三个月前"的记忆，不再稳定压过"中等相关但昨天刚写、显著度高"的记忆。
+**验收**：✅ 同等相关度下，90 天前的条目排到了最后；昨天写的两条排前面。
 
 **来源**：Generative Agents（三因子检索是它的核心贡献）。
 
@@ -46,7 +46,7 @@ score = w_rec·recency + w_sal·salience + w_rel·重叠度
 | `superseded` | 被更新的事实取代 | **是**（历史常有价值） | → 新条目 |
 | `suppressed` | 人为屏蔽，无替代 | 否 | — |
 
-**验收**：写入"搬到北京"后，旧的"住在上海"变成 `superseded` 且指向新条目；默认检索两条都出，`latest_only` 只出新。
+**验收**：✅ 旧条目变 `superseded` 并指向新条目；默认检索三条都出（含旧事实），`latestOnly` 只出新；被 `merge` 的条目两次检索都不出现，但正文与指针仍在。
 
 **来源**：Mem0 Dream 的 merge / supersede / synchronize 三状态。
 
