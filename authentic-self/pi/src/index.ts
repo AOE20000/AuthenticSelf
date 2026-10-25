@@ -20,6 +20,7 @@
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Store } from './store'
+import { choosePrompt, renderTranscript, summarize } from './compress'
 
 const flag = (value: string | undefined): boolean => value === '1' || value === 'true'
 
@@ -36,6 +37,10 @@ interface State {
   pressure: number
   /** 上次称重得到的 token 数。 */
   tokens: number
+  /** 上一次压缩产出的纪要；区域没变就复用它。 */
+  digest?: { text: string; covered: number }
+  /** 纪要覆盖区域的签名，用于判断是否需要重算。 */
+  digestSignature?: string
   /** 本次运行是否已经触发过压缩，防重入。 */
   compacted: boolean
   /** 最近一条 assistant 产出的线索文本。 */
@@ -189,29 +194,82 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     state.tokens = usage.tokens
 
     // 单 turn 内膨胀时，pi 的压缩动不了（它按 turn 边界切，切不出东西）。
-    // 这里先把旧的工具结果折成索引行——不删存档，只改发给模型的那一份。
+    // 这里由我们自己压：先让旁路模型把较早的部分写成「按轮纪要」，
+    // 失败则退回确定性折叠（只留一行索引）。两者都只改发给模型的那一份。
     if (state.pressure < foldAt) return undefined
     const messages = event.messages
+    const roleOf = (index: number): string | undefined => (messages[index] as { role?: string }).role
     const toolIndexes = messages
       .map((message, index) => (message as { role?: string }).role === 'toolResult' ? index : -1)
       .filter(index => index >= 0)
-    const foldable = toolIndexes.slice(0, Math.max(0, toolIndexes.length - foldKeep))
-    if (foldable.length === 0) return undefined
+    if (toolIndexes.length <= foldKeep) return undefined
 
+    // 保留最后 foldKeep 条工具结果。
+    // 切点规则（踩过 400 才定下来的）：
+    //   被保留的 toolResult 的发起者（assistant）也必须保留，
+    //   所以折叠区间结束在"发起者的上一条 assistant"处，而不是 toolResult 处。
+    //   否则会留下孤儿 tool 消息，服务端直接报 "role 'tool' must be a response to ..."。
+    const cutoff = toolIndexes[toolIndexes.length - foldKeep]
+    const lastAssistantBefore = (limit: number): number => {
+      for (let index = limit - 1; index >= 0; index -= 1) {
+        if (roleOf(index) === 'assistant') return index
+      }
+      return -1
+    }
+    const owner = lastAssistantBefore(cutoff)
+    if (owner <= 0) return undefined
+    const dropEnd = owner
+    const foldStart = lastAssistantBefore(owner)
+    if (foldStart <= 0) return undefined
+    const old = messages.slice(foldStart, dropEnd)
+    if (old.length === 0) return undefined
+
+    // 区域没变就复用上一份纪要，避免每次请求都重算
+    const signature = old.map(message => JSON.stringify(message).length).join(',')
+    if (state.digestSignature !== signature) {
+      const userTurns = old.filter(message => (message as { role?: string }).role === 'user').length
+      const tools = old.filter(message => (message as { role?: string }).role === 'toolResult').length
+      const budget = AbortSignal.timeout(Number(process.env.AS_SUMMARY_TIMEOUT ?? 15000))
+      const signal = ctx.signal === undefined ? budget : AbortSignal.any([ctx.signal, budget])
+      const text = await summarize(renderTranscript(old), choosePrompt(tools, userTurns), signal)
+      if (text !== undefined) {
+        state.digest = { text, covered: old.length }
+        state.digestSignature = signature
+        state.pendingAudit.push({ type: 'custom', customType: 'as/digest', data: { covered: old.length, chars: text.length } })
+        if (debug) process.stderr.write(`[as] digest ${old.length} messages -> ${text.length} chars\n`)
+      } else {
+        state.digest = undefined
+        state.digestSignature = signature
+        if (debug) process.stderr.write('[as] digest failed, fallback to fold\n')
+      }
+    }
+
+    const digest = state.digest
     let folded = 0
-    const next = messages.map((message, index) => {
-      if (!foldable.includes(index)) return message
-      const content = (message as { content?: unknown }).content
-      const text = Array.isArray(content)
-        ? content.map(block => String((block as { text?: string }).text ?? '')).join('')
-        : String(content ?? '')
-      if (text.startsWith('[已折叠')) return message
-      folded += 1
-      return {
-        ...message,
-        content: [{ type: 'text', text: `[已折叠｜较早的工具结果｜原文 ${text.length} 字] 需要细节请重新执行，或从归档检索。` }],
-      } as typeof message
-    })
+    const next: typeof messages = []
+    for (const [index, message] of messages.entries()) {
+      if (index < foldStart || index >= dropEnd) { next.push(message); continue }
+      if (digest === undefined) {
+        const content = (message as { content?: unknown }).content
+        const text = Array.isArray(content)
+          ? content.map(block => String((block as { text?: string }).text ?? '')).join('')
+          : String(content ?? '')
+        folded += 1
+        next.push({
+          ...message,
+          content: [{ type: 'text', text: `[已折叠｜较早的工具结果｜原文 ${text.length} 字] 需要细节请重新执行，或从归档检索。` }],
+        } as typeof message)
+      }
+      // digest 存在时：这一段整段丢弃，下面统一插入一条纪要
+    }
+    if (digest !== undefined) {
+      next.splice(foldStart, 0, {
+        role: 'user',
+        content: [{ type: 'text', text: `【上下文纪要｜较早的 ${digest.covered} 条已压缩】\n${digest.text}` }],
+      } as typeof messages[number])
+      state.pendingAudit.push({ type: 'custom', customType: 'as/compact_view', data: { covered: digest.covered } })
+      return { messages: next }
+    }
     if (folded === 0) return undefined
     state.pendingAudit.push({ type: 'custom', customType: 'as/fold', data: { count: folded, at: state.pressure } })
     if (debug) process.stderr.write(`[as] folded ${folded} tool result(s) at ${(state.pressure * 100).toFixed(1)}%\n`)
