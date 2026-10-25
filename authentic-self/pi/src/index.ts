@@ -28,8 +28,21 @@ interface State {
   rounds: number
   /** 本句已注入过的条目，避免重复。 */
   injected: Set<string>
+  /** 本句新写入库的条目，攒到 turn 末写一条审计。 */
+  written: string[]
   /** 最近一条 assistant 产出的线索文本。 */
   cue?: { text: string; kind: 'reasoning' | 'fallback' }
+}
+
+/** 取消息里的纯文本（用户发言用）。 */
+function plainText(message: unknown): string {
+  const content = (message as { content?: unknown }).content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter(block => (block as { type?: string }).type === 'text')
+    .map(block => String((block as { text?: string }).text ?? ''))
+    .join('\n')
 }
 
 /** 从消息内容里取推理；没有推理就退回正文。 */
@@ -54,6 +67,29 @@ function readMessage(message: unknown): { text: string; kind: 'reasoning' | 'fal
 /** 把时间戳渲染成日期标签。 */
 function dateLabel(ms: number): string {
   return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString().slice(0, 10) : '时间未知'
+}
+
+/**
+ * 从用户发言里抽"明确要记住"的内容。
+ *
+ * 只认显式句式——这是沉默成本最低、误写代价也最低的入口。
+ * 判不出来就不写，宁缺毋滥：写错一条，之后每次召回都要还债。
+ * @param text - 用户这一句的正文。
+ * @returns 抽到的内容，没有则空数组。
+ */
+function extractExplicit(text: string): string[] {
+  const patterns = [
+    /(?:请|帮我)?(?:记住|记下|记一下)[：:，,]?\s*([^\n。！？]{4,})/gu,
+    /(?:别忘了|不要忘记|以后都)[：:，,]?\s*([^\n。！？]{4,})/gu,
+  ]
+  const out: string[] = []
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const value = match[1]?.trim()
+      if (value !== undefined && value.length >= 4) out.push(value)
+    }
+  }
+  return out
 }
 
 /**
@@ -95,7 +131,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   const store = new Store(process.env.AS_DB || undefined)
-  const state: State = { rounds: 0, injected: new Set() }
+  const state: State = { rounds: 0, injected: new Set(), written: [] }
 
   /** 库为空时播种。仅用于测试，正式形态应由下行旁路写入。 */
   const seed = process.env.AS_SEED
@@ -120,6 +156,14 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       // 新的用户发言 = 新的回应，轮次与去重集合清零
       state.rounds = 0
       state.injected.clear()
+
+      // 下行写入：只认显式句式（"记住 X"），其余交给旁路判断
+      for (const fact of extractExplicit(plainText(event.message))) {
+        const existing = store.findSimilar(fact)
+        if (existing !== undefined) continue
+        const entry = store.add(fact, { origin: 'user', salience: 0.8 })
+        state.written.push(entry.id)
+      }
       return
     }
     if (role === 'assistant') {
@@ -133,12 +177,20 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   })
 
   pi.on('agent_before_settle', async (event) => {
-    if (state.rounds >= maxRounds) return undefined
-    const cue = state.cue
-    if (cue === undefined || cue.text.length < 20) return undefined
+    // 本轮写入的审计：不管有没有注入，都要留痕
+    const audit: unknown[] = []
+    if (state.written.length > 0) {
+      audit.push({ type: 'custom', customType: 'as/write', data: { ids: [...state.written] } })
+      state.written = []
+    }
 
-    const picked = store.recall(cue.text, perRecall, state.injected)
-    if (picked.length === 0) return undefined
+    const cue = state.cue
+    const canInject = state.rounds < maxRounds && cue !== undefined && cue.text.length >= 20
+    const picked = canInject ? store.recall(cue.text, perRecall, state.injected) : []
+
+    if (picked.length === 0) {
+      return audit.length > 0 ? { entries: audit as never[] } : undefined
+    }
 
     state.rounds += 1
     for (const entry of picked) state.injected.add(entry.id)
@@ -146,6 +198,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const text = render(picked, state.rounds)
     return {
       entries: [
+        ...audit,
         // 审计条目：只有结构，不占模型上下文，但进存档
         {
           type: 'custom',

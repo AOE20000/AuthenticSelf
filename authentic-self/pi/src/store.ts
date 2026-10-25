@@ -164,6 +164,30 @@ export class Store {
   }
 
   /**
+   * 找一条已经很像的记忆。
+   *
+   * 写入前先问这个——否则同一个事实会被存十遍，最后惩罚的是召回质量。
+   * 用二元组 Jaccard 相似度，阈值偏高（0.82），宁可漏合并也不要误合并。
+   * @param text - 待写入的正文。
+   * @returns 命中的旧条目，没有则 undefined。
+   */
+  findSimilar(text: string): MemoryEntry | undefined {
+    const candidate = bigrams(text)
+    if (candidate.size === 0) return undefined
+    const rows = this.db.prepare("SELECT * FROM memory_entry WHERE state = 'active'").all() as unknown as Row[]
+    let best: { row: Row; score: number } | undefined
+    for (const row of rows) {
+      const other = bigrams(row.text)
+      if (other.size === 0) continue
+      let shared = 0
+      for (const gram of candidate) if (other.has(gram)) shared += 1
+      const score = shared / (candidate.size + other.size - shared)
+      if (score >= 0.82 && (best === undefined || score > best.score)) best = { row, score }
+    }
+    return best === undefined ? undefined : toEntry(best.row)
+  }
+
+  /**
    * 软抑制：只改状态，保留正文。
    * @returns 是否命中。
    */
