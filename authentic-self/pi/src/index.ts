@@ -19,7 +19,7 @@
  */
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
-import { similarity, Store } from './store'
+import { Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList } from './maintain'
 import {
@@ -542,10 +542,10 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     let remembered = 0
     for (const fact of remembers) {
-      // 与"记住 X"共用去重口径：已经很像的就不再写
+      // 与"记住 X"共用去重口径：字面已经很像的就不再写。
+      // 语义级的改写副本**故意不拦**——确定性过滤的误判要 AuthenticSelf 来修，
+      // 而模型的误判会随模型更新自然恢复。代价是偶尔多一条，可接受。
       if (store.findSimilar(fact.text) !== undefined) continue
-      // 本轮刚有"取代/合并"时，别再把同一件事换个说法补一条
-      if (replaced.some(text => similarity(fact.text, text) >= 0.2)) continue
       store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath ?? '其他' })
       remembered += 1
     }

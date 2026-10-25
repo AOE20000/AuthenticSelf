@@ -29,6 +29,14 @@ const RECENCY_HALF_LIFE_DAYS = 7
  */
 const MAX_TAG_CHARS = 7
 
+/**
+ * 标签树的根，固定为「记忆」。
+ *
+ * 所有标签都挂在它下面（路径形如 `记忆/项目/Halcyon`），它本身不可合并、不可修剪、
+ * 不可改名——这些守卫在代码里，不在提示词里。
+ */
+const ROOT_TAG = '记忆'
+
 /** 去掉标点后数长度。中英文标点都算标点。 */
 function textLength(value: string): number {
   return value.replace(/[\p{P}\p{S}]/gu, '').length
@@ -194,6 +202,7 @@ export class Store {
     if (!columns.some(column => column.name === 'tag_id')) {
       this.db.exec('ALTER TABLE memory_entry ADD COLUMN tag_id TEXT')
     }
+    this.ensureTag(ROOT_TAG)
     this.file = file
   }
 
@@ -372,11 +381,15 @@ export class Store {
    * @param path - 形如 `工作/项目/Halcyon`。
    * @returns 叶子标签 id；路径不合法或超限时为 undefined。
    */
-  ensureTag(path: string): string | undefined {
-    const segments = path.split('/').map(part => part.trim()).filter(part => part !== '')
+  ensureTag(rawPath: string): string | undefined {
+    let segments = rawPath.split('/').map(part => part.trim()).filter(part => part !== '')
     if (segments.length === 0) return undefined
     if (segments.some(segment => textLength(segment) === 0 || textLength(segment) > MAX_TAG_CHARS)) return undefined
 
+    // 根之下才有世界：没写 `记忆/` 前缀的路径自动挂到根下
+    if (!(segments.length === 1 && segments[0] === ROOT_TAG) && segments[0] !== ROOT_TAG) {
+      segments = [ROOT_TAG, ...segments]
+    }
     const full = segments.join('/')
     const existing = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(full) as unknown as { id: string } | undefined
     if (existing !== undefined) return existing.id
@@ -420,6 +433,8 @@ export class Store {
    */
   mergeTag(from: string, to: string): number {
     if (from === to) return 0
+    // 根不可动：既不能被合并走，也不能把别的东西并进根里摊平
+    if (from === ROOT_TAG || to === ROOT_TAG) return 0
     // 目标不能在被合并的枝里：否则挪完记忆、删旧枝时会连目标一起删掉
     if (to.startsWith(`${from}/`)) return 0
     const toId = this.ensureTag(to)
@@ -440,6 +455,7 @@ export class Store {
    * @returns 被挪动的记忆条数；无法上提时为 0。
    */
   pruneTag(path: string): number {
+    if (path === ROOT_TAG) return 0
     const segments = path.split('/').map(part => part.trim()).filter(part => part !== '')
     if (segments.length <= 1) return 0
     const parentPath = segments.slice(0, -1).join('/')
