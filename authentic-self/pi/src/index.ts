@@ -19,9 +19,9 @@
  */
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
-import { Store } from './store'
+import { similarity, Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
-import { MAINTENANCE_RULES, parseMaintenance } from './maintain'
+import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList } from './maintain'
 import {
   applyCompression,
   parseBatch,
@@ -164,6 +164,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const turnCache = new Map<string, Map<number, TurnResult>>()
   const maintEvery = Number(process.env.AS_MAINT_EVERY ?? 10)
   const maintWindow = Number(process.env.AS_MAINT_WINDOW ?? 10)
+  const maintMemoryWindow = Number(process.env.AS_MAINT_MEMORY ?? 20)
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -483,11 +484,20 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const window = turns.slice(-maintWindow)
     if (window.length < 2) return undefined
 
+    // 记忆清单：只给 active 的最近若干条，模型按编号判 merge / supersede
+    const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
+    const transcript = [
+      renderBatch(messages, window),
+      '',
+      '记忆清单（可引用编号）：',
+      listed.length > 0 ? renderMemoryList(listed) : '（空）',
+    ].join('\n')
+
     const budget = AbortSignal.timeout(Number(process.env.AS_MAINT_TIMEOUT ?? 20000))
-    const text = await summarize(renderBatch(messages, window), MAINTENANCE_RULES, budget)
+    const text = await summarize(transcript, MAINTENANCE_RULES, budget)
     if (text === undefined) return undefined
 
-    const { marks, remembers } = parseMaintenance(text)
+    const { marks, remembers, relations } = parseMaintenance(text)
     let marked = 0
     for (const mark of marks) {
       const turn = window.find(item => item.index === mark.turn)
@@ -498,17 +508,39 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       marked += 1
     }
 
+    // merge / supersede：编号是对上面清单的引用
+    const replaced: string[] = []
+    let related = 0
+    for (const relation of relations) {
+      const older = listed[relation.older - 1]
+      const newer = listed[relation.newer - 1]
+      if (older === undefined || newer === undefined) continue
+      const applied = relation.op === 'merge'
+        ? store.merge(older.id, newer.id)
+        : store.supersede(older.id, newer.id)
+      if (applied) {
+        related += 1
+        replaced.push(newer.text)
+      }
+    }
+
     let remembered = 0
     for (const fact of remembers) {
       // 与"记住 X"共用去重口径：已经很像的就不再写
       if (store.findSimilar(fact) !== undefined) continue
+      // 本轮刚有"取代/合并"时，别再把同一件事换个说法补一条
+      if (replaced.some(text => similarity(fact, text) >= 0.2)) continue
       store.add(fact, { origin: 'model', salience: 0.6 })
       remembered += 1
     }
 
-    if (marked === 0 && remembered === 0) return undefined
-    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, remember ${remembered}\n`)
-    return { type: 'custom', customType: 'as/maint', data: { marked, remembered, window: window.length } }
+    if (marked === 0 && remembered === 0 && related === 0) return undefined
+    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, remember ${remembered}, relate ${related}\n`)
+    return {
+      type: 'custom',
+      customType: 'as/maint',
+      data: { marked, remembered, related, window: window.length },
+    }
   }
 
   /**

@@ -102,6 +102,22 @@ function bigrams(text: string): Set<string> {
   return out
 }
 
+/**
+ * 两段文本的二元组 Jaccard 相似度。
+ * 只做粗筛，不做语义判断——语义判断交给旁路模型。
+ * @param left - 文本一。
+ * @param right - 文本二。
+ * @returns 0..1。
+ */
+export function similarity(left: string, right: string): number {
+  const a = bigrams(left)
+  const b = bigrams(right)
+  if (a.size === 0 || b.size === 0) return 0
+  let shared = 0
+  for (const gram of a) if (b.has(gram)) shared += 1
+  return shared / (a.size + b.size - shared)
+}
+
 interface Row {
   id: string
   kind: string

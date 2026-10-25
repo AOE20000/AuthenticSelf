@@ -16,6 +16,8 @@ export interface MaintenanceResult {
   marks: { turn: number; reason: string }[]
   /** 要写进记忆库的事实。 */
   remembers: string[]
+  /** 记忆之间的关系：编号指向提示词里的记忆清单。 */
+  relations: { op: 'merge' | 'supersede'; older: number; newer: number }[]
 }
 
 /**
@@ -26,11 +28,13 @@ export interface MaintenanceResult {
  * - 只记"下次还用得上"的事实，不要转述对话
  */
 export const MAINTENANCE_RULES = [
-  '你在做一次对话回顾。你会看到最近若干轮，请输出两类判断。',
+  '你在做一次对话回顾。你会看到最近若干轮对话，以及一份记忆清单。',
   '',
   '输出格式（每行一条，不要其他文字）：',
-  'MARK Tn <原因>      ← 这一轮必须原样保留',
-  'REMEMBER <一句话事实>  ← 这条值得长期记住',
+  'MARK Tn <原因>              ← 这一轮必须原样保留',
+  'REMEMBER <一句话事实>        ← 这条值得长期记住',
+  'SUPERSEDE <旧编号> <新编号>   ← 旧记忆被新记忆取代（同一事实的新版本）',
+  'MERGE <旧编号> <新编号>       ← 旧记忆的信息被新记忆完全包含',
   '',
   '什么时候 MARK（只标非留不可的）：',
   '- 用户立下了承诺、定了截止时间、明确了约束',
@@ -42,14 +46,30 @@ export const MAINTENANCE_RULES = [
   '- 稳定的事实：项目名、技术选型、长期偏好、身份信息',
   '- 用户的明确纠正："不是 X，是 Y"',
   '- 不要记录寒暄、过程、一次性细节、以及已经在上面列出的承诺（那些走 MARK）',
+  '- **先看记忆清单**：已有等价内容的不要再写；事实变了就写关系（见下），不要另起一条',
+  '',
+  '什么时候写关系（**拿不准就不写**）：',
+  '- SUPERSEDE：「我住在上海」→「我搬到北京了」，同一件事的新旧版本；',
+  '  旧的保留可查，但默认检索时要能看出它已被取代',
+  '- MERGE：新记忆把旧记忆的信息全包了，还多了细节',
+  '- 只是话题相关、或两条可以并存，**都不写**。乱合并会把记忆吃掉。',
   '',
   '原因字段用两三个字：commitment / pending / explicit / preference。',
 ].join('\n')
+
+/**
+ * 渲染记忆清单，供模型按编号引用。
+ * @param entries - 待判定的记忆（建议只给 active 的最近若干条）。
+ */
+export function renderMemoryList(entries: readonly { text: string }[]): string {
+  return entries.map((entry, index) => `#${index + 1} ${entry.text}`).join('\n')
+}
 
 /** 解析维护输出；坏行直接丢。 */
 export function parseMaintenance(output: string): MaintenanceResult {
   const marks: { turn: number; reason: string }[] = []
   const remembers: string[] = []
+  const relations: MaintenanceResult['relations'] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
     if (line === '') continue
@@ -64,7 +84,16 @@ export function parseMaintenance(output: string): MaintenanceResult {
     if (remember !== null) {
       const text = remember[1].trim()
       if (text.length >= 4) remembers.push(text)
+      continue
+    }
+    const relation = /^(MERGE|SUPERSEDE)\s+#?(\d+)\s+#?(\d+)$/iu.exec(line)
+    if (relation !== null) {
+      const older = Number(relation[2])
+      const newer = Number(relation[3])
+      if (Number.isFinite(older) && Number.isFinite(newer) && older !== newer) {
+        relations.push({ op: relation[1].toUpperCase() === 'MERGE' ? 'merge' : 'supersede', older, newer })
+      }
     }
   }
-  return { marks, remembers }
+  return { marks, remembers, relations }
 }
