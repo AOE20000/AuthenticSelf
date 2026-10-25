@@ -14,8 +14,8 @@
 export interface MaintenanceResult {
   /** 要保护的轮：轮号 + 原因。 */
   marks: { turn: number; reason: string }[]
-  /** 要写进记忆库的事实。 */
-  remembers: string[]
+  /** 要写进记忆库的事实（带标签路径；没有路径时为未分类）。 */
+  remembers: { tagPath?: string; text: string }[]
   /** 记忆之间的关系：编号指向提示词里的记忆清单。 */
   relations: { op: 'merge' | 'supersede'; older: number; newer: number }[]
 }
@@ -32,7 +32,7 @@ export const MAINTENANCE_RULES = [
   '',
   '输出格式（每行一条，不要其他文字）：',
   'MARK Tn <原因>              ← 这一轮必须原样保留',
-  'REMEMBER <一句话事实>        ← 这条值得长期记住',
+  'REMEMBER <标签路径> | <一句话事实>   ← 这条值得长期记住，并归到这个标签下',
   'SUPERSEDE <旧编号> <新编号>   ← 旧记忆被新记忆取代（同一事实的新版本）',
   'MERGE <旧编号> <新编号>       ← 旧记忆的信息被新记忆完全包含',
   '',
@@ -47,6 +47,8 @@ export const MAINTENANCE_RULES = [
   '- 用户的明确纠正："不是 X，是 Y"',
   '- 不要记录寒暄、过程、一次性细节、以及已经在上面列出的承诺（那些走 MARK）',
   '- **先看记忆清单**：已有等价内容的不要再写；事实变了就写关系（见下），不要另起一条',
+  '- **先用现有的标签**（见「现有标签」）。实在没有合适的，才新建路径，最多三层、每层不超过六个字',
+  '- 拿不准归到哪儿就用 `其他`',
   '',
   '什么时候写关系（**拿不准就不写**）：',
   '- SUPERSEDE：「我住在上海」→「我搬到北京了」，同一件事的新旧版本；',
@@ -80,10 +82,11 @@ export function parseMaintenance(output: string): MaintenanceResult {
       if (Number.isFinite(turn) && reason !== '') marks.push({ turn, reason })
       continue
     }
-    const remember = /^REMEMBER\s+(.+)$/iu.exec(line)
+    const remember = /^REMEMBER\s+(?:([^|]+?)\s*\|\s*)?(.+)$/iu.exec(line)
     if (remember !== null) {
-      const text = remember[1].trim()
-      if (text.length >= 4) remembers.push(text)
+      const tagPath = remember[1]?.trim()
+      const text = remember[2]?.trim() ?? ''
+      if (text.length >= 4) remembers.push(tagPath === undefined || tagPath === '' ? { text } : { tagPath, text })
       continue
     }
     const relation = /^(MERGE|SUPERSEDE)\s+#?(\d+)\s+#?(\d+)$/iu.exec(line)

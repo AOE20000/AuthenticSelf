@@ -229,9 +229,9 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       }
       const lines = entries.slice(0, 20).map(entry => {
         const tail = entry.replacedBy === undefined ? '' : ` → ${entry.replacedBy}`
-        return `${entry.state.padEnd(10)} ${entry.text.slice(0, 40)}${tail}`
+        return `${entry.state.padEnd(10)} [${entry.tag ?? '未分类'}] ${entry.text.slice(0, 36)}${tail}`
       })
-      notify(ctx, [`记忆库（${entries.length} 条，显示前 20）`, ...lines].join('\n'), 'info')
+      notify(ctx, [`记忆库（${entries.length} 条 / ${store.tagPaths().length} 个标签，显示前 20）`, ...lines].join('\n'), 'info')
     },
   })
 
@@ -486,11 +486,15 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     // 记忆清单：只给 active 的最近若干条，模型按编号判 merge / supersede
     const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
+    const tagPaths = store.tagPaths()
     const transcript = [
       renderBatch(messages, window),
       '',
       '记忆清单（可引用编号）：',
       listed.length > 0 ? renderMemoryList(listed) : '（空）',
+      '',
+      '现有标签（优先复用）：',
+      tagPaths.length > 0 ? tagPaths.slice(0, 40).join('、') : '（空）',
     ].join('\n')
 
     const budget = AbortSignal.timeout(Number(process.env.AS_MAINT_TIMEOUT ?? 20000))
@@ -527,10 +531,10 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     let remembered = 0
     for (const fact of remembers) {
       // 与"记住 X"共用去重口径：已经很像的就不再写
-      if (store.findSimilar(fact) !== undefined) continue
+      if (store.findSimilar(fact.text) !== undefined) continue
       // 本轮刚有"取代/合并"时，别再把同一件事换个说法补一条
-      if (replaced.some(text => similarity(fact, text) >= 0.2)) continue
-      store.add(fact, { origin: 'model', salience: 0.6 })
+      if (replaced.some(text => similarity(fact.text, text) >= 0.2)) continue
+      store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath ?? '其他' })
       remembered += 1
     }
 

@@ -21,6 +21,11 @@ export type EntryState = 'active' | 'merged' | 'superseded' | 'suppressed'
 /** 时近半衰期（天）。参照 Generative Agents 的指数衰减，但以天为单位。 */
 const RECENCY_HALF_LIFE_DAYS = 7
 
+/** 标签树的硬上限：层数、单层字数、总个数。超了就退回"未分类"，不让树长成草丛。 */
+const MAX_TAG_DEPTH = 3
+const MAX_TAG_SEGMENT = 12
+const MAX_TAGS = 200
+
 /** 三因子权重。三者归一后等权相加——照 Generative Agents 的做法。 */
 const W_RECENCY = 1
 const W_SALIENCE = 1
@@ -50,6 +55,7 @@ CREATE TABLE IF NOT EXISTS memory_entry (
   confidence   REAL NOT NULL DEFAULT 0.7,
   state        TEXT NOT NULL DEFAULT 'active',
   replaced_by  TEXT,
+  tag_id       TEXT,
   pinned       INTEGER NOT NULL DEFAULT 0,
   use_count    INTEGER NOT NULL DEFAULT 0
 );
@@ -58,6 +64,14 @@ CREATE INDEX IF NOT EXISTS idx_entry_state ON memory_entry (state, t_start);
 -- 维护旁路给某一轮打的标（保护不压 / 尚在跟进 等）。
 -- 键用该轮首条用户消息的 timestamp——消息本身没有 id，时间戳是唯一稳定锚点。
 -- 旁路自己的小账本：上次维护到第几轮之类。
+-- 可编辑的标签树。path 用 / 分层，parent 只为方便渲染，检索一律用 path 前缀。
+CREATE TABLE IF NOT EXISTS tag (
+  id      TEXT PRIMARY KEY,
+  path    TEXT NOT NULL UNIQUE,
+  parent  TEXT,
+  created INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -82,6 +96,8 @@ export interface MemoryEntry {
   salience: number
   confidence: number
   state: string
+  /** 所属标签路径（`工作/项目/Halcyon`）。 */
+  tag?: string
   /** 被哪一条取代（merged / superseded 时有值）。 */
   replacedBy?: string
   pinned: boolean
@@ -130,6 +146,7 @@ interface Row {
   confidence: number
   state: string
   replaced_by: string | null
+  tag_path: string | null
   pinned: number
 }
 
@@ -145,6 +162,7 @@ function toEntry(row: Row): MemoryEntry {
     salience: row.salience,
     confidence: row.confidence,
     state: row.state,
+    ...row.tag_path === null ? {} : { tag: row.tag_path },
     ...row.replaced_by === null ? {} : { replacedBy: row.replaced_by },
     pinned: row.pinned === 1,
   }
@@ -165,6 +183,9 @@ export class Store {
     if (!columns.some(column => column.name === 'replaced_by')) {
       this.db.exec('ALTER TABLE memory_entry ADD COLUMN replaced_by TEXT')
     }
+    if (!columns.some(column => column.name === 'tag_id')) {
+      this.db.exec('ALTER TABLE memory_entry ADD COLUMN tag_id TEXT')
+    }
     this.file = file
   }
 
@@ -173,7 +194,7 @@ export class Store {
 
   /** 全部条目（含已抑制），供人侧审计。 */
   list(): MemoryEntry[] {
-    const rows = this.db.prepare('SELECT * FROM memory_entry ORDER BY t_start DESC').all() as unknown as Row[]
+    const rows = this.db.prepare('SELECT m.*, t.path AS tag_path FROM memory_entry m LEFT JOIN tag t ON t.id = m.tag_id ORDER BY m.t_start DESC').all() as unknown as Row[]
     return rows.map(toEntry)
   }
 
@@ -188,7 +209,10 @@ export class Store {
    * @param text - 正文。
    * @param options - 来源、显著性、来源会话。
    */
-  add(text: string, options: { origin?: string; salience?: number; sessionId?: string } = {}): MemoryEntry {
+  add(
+    text: string,
+    options: { origin?: string; salience?: number; sessionId?: string; tagPath?: string } = {},
+  ): MemoryEntry {
     this.counter += 1
     const id = `m-${Date.now().toString(36)}-${this.counter}`
     const origin = options.origin ?? 'model'
@@ -205,12 +229,15 @@ export class Store {
       state: 'active',
       pinned: false,
     }
+    const tagId = options.tagPath === undefined ? undefined : this.ensureTag(options.tagPath)
+    if (tagId !== undefined) entry.tag = options.tagPath
     this.db.prepare(`
-      INSERT INTO memory_entry (id, kind, text, span, origin, trust, session_id, t_start, salience, confidence, state, pinned, use_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+      INSERT INTO memory_entry (id, kind, text, span, origin, trust, session_id, t_start, salience, confidence, state, pinned, tag_id, use_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0)
     `).run(
       entry.id, entry.kind, entry.text, entry.span, entry.origin, entry.trust,
       options.sessionId ?? '', entry.tStart, entry.salience, entry.confidence, entry.state,
+      tagId ?? null,
     )
     return entry
   }
@@ -226,7 +253,7 @@ export class Store {
   findSimilar(text: string): MemoryEntry | undefined {
     const candidate = bigrams(text)
     if (candidate.size === 0) return undefined
-    const rows = this.db.prepare("SELECT * FROM memory_entry WHERE state = 'active'").all() as unknown as Row[]
+    const rows = this.db.prepare("SELECT m.*, t.path AS tag_path FROM memory_entry m LEFT JOIN tag t ON t.id = m.tag_id WHERE m.state = 'active'").all() as unknown as Row[]
     let best: { row: Row; score: number } | undefined
     for (const row of rows) {
       const other = bigrams(row.text)
@@ -270,7 +297,7 @@ export class Store {
     const scope = options.latestOnly === true
       ? "state = 'active'"
       : "state IN ('active', 'superseded')"
-    const rows = this.db.prepare(`SELECT * FROM memory_entry WHERE ${scope}`).all() as unknown as Row[]
+    const rows = this.db.prepare(`SELECT m.*, t.path AS tag_path FROM memory_entry m LEFT JOIN tag t ON t.id = m.tag_id WHERE ${scope}`).all() as unknown as Row[]
     const now = Date.now()
 
     const candidates = rows
@@ -327,6 +354,50 @@ export class Store {
       .prepare("UPDATE memory_entry SET state = 'merged', replaced_by = ? WHERE id = ? AND state = 'active'")
       .run(newId, oldId)
     return Number(result.changes) > 0
+  }
+
+  /**
+   * 取或建一条标签路径。**这是唯一会新建标签的地方。**
+   *
+   * 三条硬上限，防止树长成草丛：层数 ≤3、单层 ≤12 字、总数 ≤200。
+   * 超限时返回 undefined，调用方自行退回"未分类"——宁可归档粗一点，也不要标签爆炸。
+   * @param path - 形如 `工作/项目/Halcyon`。
+   * @returns 叶子标签 id；路径不合法或超限时为 undefined。
+   */
+  ensureTag(path: string): string | undefined {
+    const segments = path.split('/').map(part => part.trim()).filter(part => part !== '')
+    if (segments.length === 0 || segments.length > MAX_TAG_DEPTH) return undefined
+    if (segments.some(segment => segment.length > MAX_TAG_SEGMENT)) return undefined
+
+    const existing = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(path) as unknown as { id: string } | undefined
+    if (existing !== undefined) return existing.id
+
+    const count = this.db.prepare('SELECT COUNT(*) AS n FROM tag').get() as unknown as { n: number }
+    if (Number(count.n) >= MAX_TAGS) return undefined
+
+    let parent: string | null = null
+    let current = ''
+    let leaf = ''
+    for (const segment of segments) {
+      current = current === '' ? segment : `${current}/${segment}`
+      const row = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(current) as unknown as { id: string } | undefined
+      if (row !== undefined) {
+        leaf = row.id
+        parent = row.id
+        continue
+      }
+      this.counter += 1
+      leaf = `t-${Date.now().toString(36)}-${this.counter}`
+      this.db.prepare('INSERT INTO tag (id, path, parent, created) VALUES (?, ?, ?, ?)').run(leaf, current, parent, Date.now())
+      parent = leaf
+    }
+    return leaf
+  }
+
+  /** 现有标签路径清单，供旁路挑现成的而不是新建。 */
+  tagPaths(): string[] {
+    const rows = this.db.prepare('SELECT path FROM tag ORDER BY path').all() as unknown as { path: string }[]
+    return rows.map(row => row.path)
   }
 
   /**
