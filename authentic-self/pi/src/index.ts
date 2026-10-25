@@ -45,9 +45,12 @@ interface State {
   pressure: number
   /** 上次称重得到的 token 数。 */
   tokens: number
-  /** 上一次压缩产出的纪要；区域没变就复用它。 */
+  /** 上一次压缩后各轮的处置，供 `/as-view` 查看。 */
+  lastView: string[]
+  /** 最近一次压缩发生时的 token 数。 */
+  lastViewAt: number
+  /** 整段纪要（旧的压缩路径）与其覆盖区域签名。 */
   digest?: { text: string; covered: number }
-  /** 纪要覆盖区域的签名，用于判断是否需要重算。 */
   digestSignature?: string
   /** 本次运行是否已经触发过压缩，防重入。 */
   compacted: boolean
@@ -163,7 +166,17 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   const store = new Store(process.env.AS_DB || undefined)
-  const state: State = { rounds: 0, injected: new Set(), written: [], pendingAudit: [], pressure: 0, tokens: 0, compacted: false }
+  const state: State = {
+    rounds: 0,
+    injected: new Set(),
+    written: [],
+    pendingAudit: [],
+    pressure: 0,
+    tokens: 0,
+    compacted: false,
+    lastView: [],
+    lastViewAt: 0,
+  }
 
   /** 库为空时播种。仅用于测试，正式形态应由下行旁路写入。 */
   const seed = process.env.AS_SEED
@@ -180,6 +193,36 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
   pi.on('session_start', async (_event, ctx) => {
     notify(ctx, `AuthenticSelf 就绪：${store.count()} 条记忆`, 'info')
+  })
+
+  // 给人看的窗口：主 AI 实际收到的是压缩后的视图，存档里是原文。
+  // 这个命令把"它看到了什么"打印出来，不改变任何东西。
+  pi.registerCommand('as-view', {
+    description: '查看主 AI 实际看到的上下文（压缩后各轮的处置）',
+    handler: async (_args: string, ctx: unknown) => {
+      if (state.lastView.length === 0) {
+        notify(ctx, '还没有发生过压缩——主 AI 看到的就是原文。', 'info')
+        return
+      }
+      const head = `上次压缩（占用 ${(state.lastViewAt * 100).toFixed(1)}%）：`
+      notify(ctx, [head, ...state.lastView].join('\n'), 'info')
+    },
+  })
+
+  pi.registerCommand('as-memory', {
+    description: '查看记忆库里的条目（含已抑制与被取代的）',
+    handler: async (_args: string, ctx: unknown) => {
+      const entries = store.list()
+      if (entries.length === 0) {
+        notify(ctx, '记忆库是空的', 'info')
+        return
+      }
+      const lines = entries.slice(0, 20).map(entry => {
+        const tail = entry.replacedBy === undefined ? '' : ` → ${entry.replacedBy}`
+        return `${entry.state.padEnd(10)} ${entry.text.slice(0, 40)}${tail}`
+      })
+      notify(ctx, [`记忆库（${entries.length} 条，显示前 20）`, ...lines].join('\n'), 'info')
+    },
   })
 
   /** 压缩指令：把"不能丢"的东西点名给摘要器，而不是让它自己猜。 */
@@ -250,6 +293,14 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       data: { turns: applied.changed, dropped: applied.dropped, batches },
     })
     if (debug) process.stderr.write(`[as] turn compress ${applied.changed}/${turns.length} (dropped ${applied.dropped})\n`)
+    state.lastViewAt = state.pressure
+    state.lastView = turns.map(turn => {
+      if (turn.protected) return `T${turn.index}  保护（${turn.reason}）`
+      const result = merged.get(turn.index)
+      if (result === undefined) return `T${turn.index}  原样（未解析出来）`
+      if (result.kind === 'dup') return `T${turn.index}  = 重复 T${result.of}`
+      return `T${turn.index}  压 → ${result.text.slice(0, 40)}`
+    })
     if (debug) {
       for (const message of applied.messages as { content?: { text?: string }[] }[]) {
         const text = (message.content ?? []).map(block => block.text ?? '').join('')

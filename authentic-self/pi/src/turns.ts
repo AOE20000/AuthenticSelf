@@ -77,10 +77,12 @@ export function segmentTurns(
     const end = order + 1 < starts.length ? starts[order + 1] : messages.length
     const slice = messages.slice(start, end)
     const hasTool = slice.some(message => (message as { role?: string }).role === 'toolResult')
-    const recent = order >= starts.length - keepRecent
+    // 最后一轮永远保护：那是**正在被回答的这条发言**，改写它等于换掉问题。
+    const current = order === starts.length - 1
+    const recent = order >= starts.length - Math.max(1, keepRecent)
     const anchor = Number((messages[start] as { timestamp?: number }).timestamp ?? 0)
     const marked = marks?.get(anchor)
-    const reason = hasTool ? 'tool' : marked ?? (recent ? 'recent' : undefined)
+    const reason = hasTool ? 'tool' : marked ?? (current ? 'current' : recent ? 'recent' : undefined)
     return { index: order + 1, start, end, hasTool, protected: reason !== undefined, reason }
   })
   return turns
