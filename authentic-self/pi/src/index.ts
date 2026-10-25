@@ -135,6 +135,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const compactAt = Number(process.env.AS_COMPACT_AT ?? 0.85)
   const debug = flag(process.env.AS_DEBUG)
   const compactMin = Number(process.env.AS_COMPACT_MIN ?? 25000)
+  const foldAt = Number(process.env.AS_FOLD_AT ?? 0.6)
+  const foldKeep = Number(process.env.AS_FOLD_KEEP ?? 2)
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -179,13 +181,41 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   // 称重：每次调用前看一眼占用。**不在这里压缩**——在 context 里调 compact 会中断当前请求。
-  pi.on('context', async (_event, ctx) => {
+  pi.on('context', async (event, ctx) => {
     const usage = ctx.getContextUsage?.()
     if (usage === undefined || typeof usage.tokens !== 'number') return undefined
     const usable = Math.max(1, usage.contextWindow - reserve)
     state.pressure = usage.tokens / usable
     state.tokens = usage.tokens
-    return undefined
+
+    // 单 turn 内膨胀时，pi 的压缩动不了（它按 turn 边界切，切不出东西）。
+    // 这里先把旧的工具结果折成索引行——不删存档，只改发给模型的那一份。
+    if (state.pressure < foldAt) return undefined
+    const messages = event.messages
+    const toolIndexes = messages
+      .map((message, index) => (message as { role?: string }).role === 'toolResult' ? index : -1)
+      .filter(index => index >= 0)
+    const foldable = toolIndexes.slice(0, Math.max(0, toolIndexes.length - foldKeep))
+    if (foldable.length === 0) return undefined
+
+    let folded = 0
+    const next = messages.map((message, index) => {
+      if (!foldable.includes(index)) return message
+      const content = (message as { content?: unknown }).content
+      const text = Array.isArray(content)
+        ? content.map(block => String((block as { text?: string }).text ?? '')).join('')
+        : String(content ?? '')
+      if (text.startsWith('[已折叠')) return message
+      folded += 1
+      return {
+        ...message,
+        content: [{ type: 'text', text: `[已折叠｜较早的工具结果｜原文 ${text.length} 字] 需要细节请重新执行，或从归档检索。` }],
+      } as typeof message
+    })
+    if (folded === 0) return undefined
+    state.pendingAudit.push({ type: 'custom', customType: 'as/fold', data: { count: folded, at: state.pressure } })
+    if (debug) process.stderr.write(`[as] folded ${folded} tool result(s) at ${(state.pressure * 100).toFixed(1)}%\n`)
+    return { messages: next }
   })
 
   // 压缩：turn 结束后再动手，避免打断正在飞的请求
