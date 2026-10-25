@@ -211,7 +211,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     messages: readonly unknown[],
     signal: AbortSignal | undefined,
   ): Promise<unknown[] | undefined> {
-    const turns = segmentTurns(messages, keepRecent)
+    const turns = segmentTurns(messages, { keepRecent, marks: store.turnMarks() })
     const candidates = turns.filter(turn => !turn.protected)
     if (candidates.length < 2) return undefined
 

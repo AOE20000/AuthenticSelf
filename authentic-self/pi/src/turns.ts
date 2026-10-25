@@ -31,9 +31,6 @@ export interface Turn {
 /** 切段时排除我们插入的纪要消息。 */
 const DIGEST_MARK = '【T'
 
-/** 用户明说"别压"的说法。 */
-const PROTECT_PATTERN = /(别压|不要压缩|不许压缩|保留原话|原样保留|一字不改)/u
-
 /** 判断一条消息是不是我们插进去的纪要。 */
 function isDigest(message: unknown): boolean {
   const content = (message as { content?: unknown }).content
@@ -53,11 +50,22 @@ function textOf(message: unknown): string {
 
 /**
  * 切轮并标出哪些不可压。
+ * 保护来源只有三处，**没有一处靠正则识别用户措辞**：
+ * - `hasTool`：结构原因，拆散 tool 配对会 400
+ * - `recent`：最近 N 轮属于工作区
+ * - `marks`：维护旁路打的标记（键是首条 user 消息的 timestamp）
+ *
  * @param messages - 完整消息数组（不含 system）。
- * @param keepRecent - 最近多少轮视为工作区，不压（默认 2）。
+ * @param options.keepRecent - 最近多少轮视为工作区（默认 2）。
+ * @param options.marks - 维护旁路打的保护标记。
  * @returns 轮次列表；轮号从 1 开始。
  */
-export function segmentTurns(messages: readonly unknown[], keepRecent = 2): Turn[] {
+export function segmentTurns(
+  messages: readonly unknown[],
+  options: { keepRecent?: number; marks?: ReadonlyMap<number, string> } = {},
+): Turn[] {
+  const keepRecent = options.keepRecent ?? 2
+  const marks = options.marks
   const starts: number[] = []
   messages.forEach((message, index) => {
     const role = (message as { role?: string }).role
@@ -69,9 +77,10 @@ export function segmentTurns(messages: readonly unknown[], keepRecent = 2): Turn
     const end = order + 1 < starts.length ? starts[order + 1] : messages.length
     const slice = messages.slice(start, end)
     const hasTool = slice.some(message => (message as { role?: string }).role === 'toolResult')
-    const asksProtect = slice.some(message => PROTECT_PATTERN.test(textOf(message)))
     const recent = order >= starts.length - keepRecent
-    const reason = hasTool ? 'tool' : asksProtect ? 'user-asked' : recent ? 'recent' : undefined
+    const anchor = Number((messages[start] as { timestamp?: number }).timestamp ?? 0)
+    const marked = marks?.get(anchor)
+    const reason = hasTool ? 'tool' : marked ?? (recent ? 'recent' : undefined)
     return { index: order + 1, start, end, hasTool, protected: reason !== undefined, reason }
   })
   return turns

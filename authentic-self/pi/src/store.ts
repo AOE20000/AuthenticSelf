@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS memory_entry (
   use_count    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_entry_state ON memory_entry (state, t_start);
+
+-- 维护旁路给某一轮打的标（保护不压 / 尚在跟进 等）。
+-- 键用该轮首条用户消息的 timestamp——消息本身没有 id，时间戳是唯一稳定锚点。
+CREATE TABLE IF NOT EXISTS turn_mark (
+  anchor_ts INTEGER PRIMARY KEY,
+  reason    TEXT NOT NULL,
+  session   TEXT NOT NULL DEFAULT '',
+  created   INTEGER NOT NULL
+);
 `
 
 export interface MemoryEntry {
@@ -296,6 +305,34 @@ export class Store {
       .prepare("UPDATE memory_entry SET state = 'merged', replaced_by = ? WHERE id = ? AND state = 'active'")
       .run(newId, oldId)
     return Number(result.changes) > 0
+  }
+
+  /**
+   * 给某一轮打标。**这是维护旁路的职责**，压缩侧只读不写。
+   * @param anchorTs - 该轮首条用户消息的 timestamp。
+   * @param reason - 标记原因，压缩与审计都用它。
+   * @param sessionId - 来源会话，便于追溯。
+   */
+  markTurn(anchorTs: number, reason: string, sessionId = ''): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO turn_mark (anchor_ts, reason, session, created) VALUES (?, ?, ?, ?)')
+      .run(anchorTs, reason, sessionId, Date.now())
+  }
+
+  /**
+   * 撤销某一轮的标记。
+   * @param anchorTs - 该轮的时间戳。
+   * @returns 是否命中。
+   */
+  unmarkTurn(anchorTs: number): boolean {
+    const result = this.db.prepare('DELETE FROM turn_mark WHERE anchor_ts = ?').run(anchorTs)
+    return Number(result.changes) > 0
+  }
+
+  /** 读取全部标记：锚点时间戳 → 原因。 */
+  turnMarks(): Map<number, string> {
+    const rows = this.db.prepare('SELECT anchor_ts, reason FROM turn_mark').all() as unknown as { anchor_ts: number; reason: string }[]
+    return new Map(rows.map(row => [Number(row.anchor_ts), row.reason]))
   }
 
   /** 关闭连接。 */
