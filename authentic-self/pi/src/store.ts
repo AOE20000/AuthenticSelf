@@ -57,6 +57,12 @@ CREATE INDEX IF NOT EXISTS idx_entry_state ON memory_entry (state, t_start);
 
 -- 维护旁路给某一轮打的标（保护不压 / 尚在跟进 等）。
 -- 键用该轮首条用户消息的 timestamp——消息本身没有 id，时间戳是唯一稳定锚点。
+-- 旁路自己的小账本：上次维护到第几轮之类。
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS turn_mark (
   anchor_ts INTEGER PRIMARY KEY,
   reason    TEXT NOT NULL,
@@ -327,6 +333,17 @@ export class Store {
   unmarkTurn(anchorTs: number): boolean {
     const result = this.db.prepare('DELETE FROM turn_mark WHERE anchor_ts = ?').run(anchorTs)
     return Number(result.changes) > 0
+  }
+
+  /** 读一个小值。 */
+  getMeta(key: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as unknown as { value: string } | undefined
+    return row?.value
+  }
+
+  /** 写一个小值。 */
+  setMeta(key: string, value: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, value)
   }
 
   /** 读取全部标记：锚点时间戳 → 原因。 */

@@ -21,6 +21,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
+import { MAINTENANCE_RULES, parseMaintenance } from './maintain'
 import {
   applyCompression,
   parseBatch,
@@ -54,6 +55,10 @@ interface State {
   digestSignature?: string
   /** 本次运行是否已经触发过压缩，防重入。 */
   compacted: boolean
+  /** 用户发言计数——维护旁路的节拍。 */
+  userTurns: number
+  /** 攒到下一次 settle 时执行维护。 */
+  pendingMaintenance: boolean
   /** 最近一条 assistant 产出的线索文本。 */
   cue?: { text: string; kind: 'reasoning' | 'fallback' }
 }
@@ -157,6 +162,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const keepRecent = Number(process.env.AS_KEEP_RECENT ?? 2)
   const dupPolicy = process.env.AS_DUP === 'drop' ? 'drop' as const : 'placeholder' as const
   const turnCache = new Map<string, Map<number, TurnResult>>()
+  const maintEvery = Number(process.env.AS_MAINT_EVERY ?? 10)
+  const maintWindow = Number(process.env.AS_MAINT_WINDOW ?? 10)
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -176,6 +183,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     compacted: false,
     lastView: [],
     lastViewAt: 0,
+    userTurns: 0,
+    pendingMaintenance: false,
   }
 
   /** 库为空时播种。仅用于测试，正式形态应由下行旁路写入。 */
@@ -437,6 +446,10 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       state.rounds = 0
       state.injected.clear()
 
+      // 每 N 轮排一次维护（节拍按用户发言算，不按步数）
+      state.userTurns += 1
+      if (maintEvery > 0 && state.userTurns % maintEvery === 0) state.pendingMaintenance = true
+
       // 下行写入：只认显式句式（"记住 X"），其余交给旁路判断
       for (const fact of extractExplicit(plainText(event.message))) {
         const existing = store.findSimilar(fact)
@@ -456,6 +469,64 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     store.close()
   })
 
+  /**
+   * 维护旁路：每 N 轮回头看一次。
+   *
+   * 它只做两件事——打标（哪些轮非留不可）、补记（哪些事实值得长期记住）。
+   * 打标写进 `turn_mark`，压缩侧只读；补记走与"记住 X"同一条写库路径，但来源是模型，
+   * 所以 trust 更低。
+   * @param messages - 当前会话消息。
+   * @returns 一条审计条目；什么都没判出来时为 undefined。
+   */
+  async function runMaintenance(messages: readonly unknown[]): Promise<unknown | undefined> {
+    const turns = segmentTurns(messages, { keepRecent: 0 })
+    const window = turns.slice(-maintWindow)
+    if (window.length < 2) return undefined
+
+    const budget = AbortSignal.timeout(Number(process.env.AS_MAINT_TIMEOUT ?? 20000))
+    const text = await summarize(renderBatch(messages, window), MAINTENANCE_RULES, budget)
+    if (text === undefined) return undefined
+
+    const { marks, remembers } = parseMaintenance(text)
+    let marked = 0
+    for (const mark of marks) {
+      const turn = window.find(item => item.index === mark.turn)
+      if (turn === undefined) continue
+      const anchor = Number((messages[turn.start] as { timestamp?: number }).timestamp ?? 0)
+      if (anchor === 0) continue
+      store.markTurn(anchor, mark.reason)
+      marked += 1
+    }
+
+    let remembered = 0
+    for (const fact of remembers) {
+      // 与"记住 X"共用去重口径：已经很像的就不再写
+      if (store.findSimilar(fact) !== undefined) continue
+      store.add(fact, { origin: 'model', salience: 0.6 })
+      remembered += 1
+    }
+
+    if (marked === 0 && remembered === 0) return undefined
+    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, remember ${remembered}\n`)
+    return { type: 'custom', customType: 'as/maint', data: { marked, remembered, window: window.length } }
+  }
+
+  /**
+   * 该不该做维护？
+   *
+   * 节拍**从对话里数**，不用内存计数——每次 `pi` 调用都是新进程，计数活不过一次会话。
+   * "上次维护到第几轮"存在库的 meta 表里，所以跨进程也能接着数。
+   * @param messages - 当前会话消息。
+   * @returns 现在是否该跑。
+   */
+  function maintenanceDue(messages: readonly unknown[]): boolean {
+    if (maintEvery <= 0) return false
+    const total = segmentTurns(messages, { keepRecent: 0 }).length
+    if (total < 2) return false
+    const last = Number(store.getMeta('maint_last') ?? 0)
+    return total - last >= maintEvery
+  }
+
   pi.on('agent_before_settle', async (event) => {
     // 本轮写入与压缩的审计：不管有没有注入，都要留痕
     const audit: unknown[] = [...state.pendingAudit]
@@ -463,6 +534,15 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     if (state.written.length > 0) {
       audit.push({ type: 'custom', customType: 'as/write', data: { ids: [...state.written] } })
       state.written = []
+    }
+
+    // 维护旁路：到点就跑一次（跑完才继续，因为它的结果影响同一轮的压缩判据）
+    const contextMessages = (event.context as { contextMessages?: unknown[] } | undefined)?.contextMessages ?? []
+    if (state.pendingMaintenance || maintenanceDue(contextMessages)) {
+      state.pendingMaintenance = false
+      store.setMeta('maint_last', String(segmentTurns(contextMessages, { keepRecent: 0 }).length))
+      const entry = await runMaintenance(contextMessages)
+      if (entry !== undefined) audit.push(entry)
     }
 
     const cue = state.cue
