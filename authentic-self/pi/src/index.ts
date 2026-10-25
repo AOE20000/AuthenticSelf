@@ -579,7 +579,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   async function runRealtime(
     cueText: string,
     current: Slot[],
-  ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown } | undefined> {
+  ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown }> {
     const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
     const candidates: import('./realtime').Candidate[] = current.map(slot => ({
       index: slot.index,
@@ -604,7 +604,19 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     const budget = AbortSignal.timeout(Number(process.env.AS_REALTIME_TIMEOUT ?? 12000))
     const text = await summarize(transcript, REALTIME_RULES, budget)
-    if (text === undefined) return undefined
+    if (text === undefined) {
+      // **直注已移除**：旁路不可用 = 本轮无注入。宁可哑火，不可错注。
+      // 本轮漏掉的 REMEMBER 由维护旁路追补（延迟写入，不丢）。
+      return {
+        slots: [],
+        droppedIds: [],
+        audit: {
+          type: 'custom',
+          customType: 'as/realtime',
+          data: { ok: false, candidates: current.length, error: 'bypass-unavailable' },
+        },
+      }
+    }
 
     const { drops, rewrites, remembers } = parseRealtime(text)
     let remembered = 0
@@ -620,7 +632,6 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       .filter(slot => !dropSet.has(slot.index))
       .map(slot => ({ ...slot, text: rewrites.get(slot.index) ?? slot.text }))
 
-    if (drops.length === 0 && rewrites.size === 0 && remembered === 0) return undefined
     if (debug) process.stderr.write(`[as] realtime: drop ${drops.length}, rewrite ${rewrites.size}, remember ${remembered}\n`)
     return {
       slots,
@@ -628,7 +639,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       audit: {
         type: 'custom',
         customType: 'as/realtime',
-        data: { candidates: current.length, dropped: drops.length, rewritten: rewrites.size, remembered },
+        data: { ok: true, candidates: current.length, dropped: drops.length, rewritten: rewrites.size, remembered },
       },
     }
   }
@@ -669,20 +680,21 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     const cue = state.cue
     const canInject = state.rounds < maxRounds && cue !== undefined && cue.text.length >= 20
+    // 候选多取一倍交给实时旁路筛。**直注已移除**：旁路是唯一闸门——
+    // 它说注入才注入，它不可用就宁可不注入（错注的代价大于漏注）
     const exclude = new Set([...state.injected, ...state.dropped])
-    // 候选多取一倍交给实时旁路筛；它失败时按原样注入前 perRecall 条
     const picked = canInject ? store.recall(cue.text, perRecall * 2, exclude) : []
     let slots: Slot[] = picked.map((entry, index) => ({ entry, index: index + 1, text: entry.text }))
 
-    // 实时旁路：一次调用统一"注入决策 / 冲突合并 / 写入"。失败则全部照常注入
     if (canInject && realtimeOn) {
       const result = await runRealtime(cue.text, slots)
-      if (result !== undefined) {
-        slots = result.slots
-        // 被 DROP 的条目在本句内不得再回来（否则下一轮召回又会捞起来）
-        for (const id of result.droppedIds) state.dropped.add(id)
-        if (result.audit !== undefined) audit.push(result.audit)
-      }
+      slots = result.slots
+      // 被 DROP 的条目在本句内不得再回来（否则下一轮召回又会捞起来）
+      for (const id of result.droppedIds) state.dropped.add(id)
+      audit.push(result.audit)
+    } else if (canInject) {
+      // 显式关闭实时旁路 = 显式关闭注入（没有直注可退）
+      slots = []
     }
 
     const finalPicked = slots.slice(0, perRecall).map(slot => ({ ...slot.entry, text: slot.text }))

@@ -320,18 +320,33 @@ export class Store {
     const candidates = rows
       .filter(row => !exclude.has(row.id))
       .map(row => {
+        // 通道一（词）：线索与正文的二元组重叠
         let hits = 0
         for (const gram of bigrams(`${row.text}${row.id}`)) if (grams.has(gram)) hits += 1
-        return { row, hits }
+        // 通道二（标签）：线索包含任一标签段（受控词表，≤7 字）即命中。
+        // 标签是主题的受控命名，比任意正文稳定——「住在哪个城市」命中不了
+        // 「我搬到北京了」的正文，但能命中 `记忆/用户/城市` 的标签段。
+        let tagHit = false
+        if (row.tag_path !== null) {
+          for (const segment of row.tag_path.split('/')) {
+            if (segment !== ROOT_TAG && segment.length >= 2 && cue.includes(segment)) {
+              tagHit = true
+              break
+            }
+          }
+        }
+        return { row, hits, tagHit }
       })
-      .filter(item => item.hits > 0)
+      // 双通道任一命中即入围；零重叠不再一票否决
+      .filter(item => item.hits > 0 || item.tagHit)
 
     if (candidates.length === 0) return []
     const maxHits = Math.max(...candidates.map(item => item.hits))
 
     return candidates
-      .map(({ row, hits }) => {
-        const relevance = hits / maxHits
+      .map(({ row, hits, tagHit }) => {
+        // 结构命中（标签）是比字面重叠更强的信号，直接给满相关度
+        const relevance = Math.max(hits / maxHits, tagHit ? 1 : 0)
         const ageDays = Math.max(0, (now - row.t_start) / 86_400_000)
         const recency = Math.exp(-ageDays / RECENCY_HALF_LIFE_DAYS)
         const score = W_RECENCY * recency + W_SALIENCE * row.salience + W_RELEVANCE * relevance
