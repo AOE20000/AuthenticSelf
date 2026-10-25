@@ -397,6 +397,82 @@ export class Store {
     return id
   }
 
+  /**
+   * 标签及各自挂了多少条记忆（含子孙）。
+   * @returns 路径 → 条数，按路径排序。
+   */
+  tagStats(): { path: string; count: number }[] {
+    const rows = this.db.prepare(`
+      SELECT t.path AS path, COUNT(m.id) AS n
+      FROM tag t LEFT JOIN memory_entry m ON m.tag_id = t.id
+      GROUP BY t.path ORDER BY t.path
+    `).all() as unknown as { path: string; n: number }[]
+    return rows.map(row => ({ path: row.path, count: Number(row.n) }))
+  }
+
+  /**
+   * 合并标签：把 `from` 及其子孙下的记忆全部挪到 `to`，然后删掉 `from` 这棵枝。
+   *
+   * 用于同义标签（`项目` 与 `工作/项目`）——树会漂，这是修漂的手段。
+   * @param from - 被并掉的路径。
+   * @param to - 保留的路径；不存在会尝试创建（父级仍需已存在）。
+   * @returns 被挪动的记忆条数；`to` 建不出来时为 0。
+   */
+  mergeTag(from: string, to: string): number {
+    if (from === to) return 0
+    // 目标不能在被合并的枝里：否则挪完记忆、删旧枝时会连目标一起删掉
+    if (to.startsWith(`${from}/`)) return 0
+    const toId = this.ensureTag(to)
+    if (toId === undefined) return 0
+    const moved = this.db
+      .prepare(`UPDATE memory_entry SET tag_id = ? WHERE tag_id IN (
+        SELECT id FROM tag WHERE path = ? OR path LIKE ? || '/%')`)
+      .run(toId, from, from)
+    this.db.prepare("DELETE FROM tag WHERE path = ? OR path LIKE ? || '/%'").run(from, from)
+    return Number(moved.changes)
+  }
+
+  /**
+   * 上提标签：把 `path` 及其子孙下的记忆挪到父级，然后删掉这棵枝。
+   *
+   * 用于"只有一两条记忆却占了很深一层"的空枝。根标签不能上提（没有父级）。
+   * @param path - 要被上提的路径。
+   * @returns 被挪动的记忆条数；无法上提时为 0。
+   */
+  pruneTag(path: string): number {
+    const segments = path.split('/').map(part => part.trim()).filter(part => part !== '')
+    if (segments.length <= 1) return 0
+    const parentPath = segments.slice(0, -1).join('/')
+    const parent = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(parentPath) as unknown as { id: string } | undefined
+    if (parent === undefined) return 0
+    const moved = this.db
+      .prepare(`UPDATE memory_entry SET tag_id = ? WHERE tag_id IN (
+        SELECT id FROM tag WHERE path = ? OR path LIKE ? || '/%')`)
+      .run(parent.id, path, path)
+    this.db.prepare("DELETE FROM tag WHERE path = ? OR path LIKE ? || '/%'").run(path, path)
+    return Number(moved.changes)
+  }
+
+  /**
+   * 标签树用量：每条标签的直接记忆数与子树总数。
+   * 给维护旁路看——合并与修剪的判断依据是用量，不是名字。
+   */
+  tagUsage(): { path: string; direct: number; total: number }[] {
+    const rows = this.db.prepare('SELECT id, path FROM tag ORDER BY path').all() as unknown as { id: string; path: string }[]
+    const counts = this.db
+      .prepare("SELECT tag_id, COUNT(*) AS n FROM memory_entry WHERE state = 'active' AND tag_id IS NOT NULL GROUP BY tag_id")
+      .all() as unknown as { tag_id: string; n: number }[]
+    const direct = new Map(counts.map(row => [row.tag_id, Number(row.n)]))
+    return rows.map(row => {
+      const prefix = `${row.path}/`
+      let total = direct.get(row.id) ?? 0
+      for (const other of rows) {
+        if (other.path.startsWith(prefix)) total += direct.get(other.id) ?? 0
+      }
+      return { path: row.path, direct: direct.get(row.id) ?? 0, total }
+    })
+  }
+
   /** 现有标签路径清单，供旁路挑现成的而不是新建。 */
   tagPaths(): string[] {
     const rows = this.db.prepare('SELECT path FROM tag ORDER BY path').all() as unknown as { path: string }[]

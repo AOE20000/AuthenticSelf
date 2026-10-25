@@ -486,22 +486,22 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     // 记忆清单：只给 active 的最近若干条，模型按编号判 merge / supersede
     const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
-    const tagPaths = store.tagPaths()
+    const tagPaths = store.tagStats().map(stat => `${stat.path}(${stat.count})`)
     const transcript = [
       renderBatch(messages, window),
       '',
       '记忆清单（可引用编号）：',
       listed.length > 0 ? renderMemoryList(listed) : '（空）',
       '',
-      '现有标签（优先复用）：',
-      tagPaths.length > 0 ? tagPaths.slice(0, 40).join('、') : '（空）',
+      '现有标签（优先复用；括号里是挂了几条）：',
+      tagPaths.length > 0 ? tagPaths.slice(0, 60).join('、') : '（空）',
     ].join('\n')
 
     const budget = AbortSignal.timeout(Number(process.env.AS_MAINT_TIMEOUT ?? 20000))
     const text = await summarize(transcript, MAINTENANCE_RULES, budget)
     if (text === undefined) return undefined
 
-    const { marks, tags, remembers, relations } = parseMaintenance(text)
+    const { marks, tags, tagOps, remembers, relations } = parseMaintenance(text)
     let marked = 0
     for (const mark of marks) {
       const turn = window.find(item => item.index === mark.turn)
@@ -534,6 +534,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       if (store.ensureTag(path) !== undefined) tagged += 1
     }
 
+    // 标签树整理：合并同义、上提空枝。放在写记忆之前，免得刚写进去的又被搬走
+    let tagMoved = 0
+    for (const op of tagOps) {
+      tagMoved += op.op === 'merge' ? store.mergeTag(op.from, op.to) : store.pruneTag(op.path)
+    }
+
     let remembered = 0
     for (const fact of remembers) {
       // 与"记住 X"共用去重口径：已经很像的就不再写
@@ -549,7 +555,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     return {
       type: 'custom',
       customType: 'as/maint',
-      data: { marked, tagged, remembered, related, window: window.length },
+      data: { marked, tagged, remembered, related, tagMoved, window: window.length },
     }
   }
 

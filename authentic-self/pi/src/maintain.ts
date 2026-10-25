@@ -4,7 +4,7 @@
  * 它做三件事，都是主 AI 不会做也不该知道的事：
  * 1. **打标**——哪些轮必须原样保留（承诺、未完成事项、用户明确要求）
  * 2. **补记**——哪些内容值得进记忆库（超出"记住 X"这类显式句式）
- * 3. **留痕**——这次判了什么都记进审计
+ * 3. **整理**——记忆之间的关系（supersede / merge）与标签树的合并、上提
  *
  * 输出用行式契约而不是 JSON：模型写 JSON 时经常夹带解释文字，
  * 行式协议坏一行的代价小得多（坏行丢弃，其余照收）。
@@ -20,6 +20,11 @@ export interface MaintenanceResult {
   remembers: { tagPath?: string; text: string }[]
   /** 记忆之间的关系：编号指向提示词里的记忆清单。 */
   relations: { op: 'merge' | 'supersede'; older: number; newer: number }[]
+  /** 标签树的整理动作。 */
+  tagOps: (
+    | { op: 'merge'; from: string; to: string }
+    | { op: 'prune'; path: string }
+  )[]
 }
 
 /**
@@ -30,11 +35,13 @@ export interface MaintenanceResult {
  * - 只记"下次还用得上"的事实，不要转述对话
  */
 export const MAINTENANCE_RULES = [
-  '你在做一次对话回顾。你会看到最近若干轮对话，以及一份记忆清单。',
+  '你在做一次对话回顾。你会看到最近若干轮对话，以及一份记忆清单与标签树。',
   '',
   '输出格式（每行一条，不要其他文字）：',
   'MARK Tn <原因>              ← 这一轮必须原样保留',
-  'TAG <标签路径>                      ← 新建一个标签（**一次只建一层**）',
+  'TAG <标签路径>              ← 新建一个标签（**一次只建一层**）',
+  'MERGE_TAG <旧路径> <新路径>  ← 同义标签合并（深的并到浅的）',
+  'PRUNE_TAG <路径>            ← 空枝或只有一条的深层路径，上提到父级',
   'REMEMBER <标签路径> | <一句话事实>   ← 这条值得长期记住，并归到这个标签下',
   'SUPERSEDE <旧编号> <新编号>   ← 旧记忆被新记忆取代（同一事实的新版本）',
   'MERGE <旧编号> <新编号>       ← 旧记忆的信息被新记忆完全包含',
@@ -50,11 +57,17 @@ export const MAINTENANCE_RULES = [
   '- 用户的明确纠正："不是 X，是 Y"',
   '- 不要记录寒暄、过程、一次性细节、以及已经在上面列出的承诺（那些走 MARK）',
   '- **先看记忆清单**：已有等价内容的不要再写；事实变了就写关系（见下），不要另起一条',
-  '- **先用现有的标签**（见「现有标签」）。能在现有树里找到位置，就不要新建',
+  '- **先用现有的标签**（见「标签树」）。能在现有树里找到位置，就不要新建',
   '- 新建标签有硬规矩：**父级必须已经存在**，一次只能建一层。要建 `a/b` 得先有 `a`，',
   '  否则这一行会被丢弃——所以先翻现有标签，别急着往下挖',
   '- 一条标签最多 7 个字（标点不算）。层数不限，但每层都得短',
   '- 拿不准归到哪儿就用 `其他`',
+  '',
+  '什么时候整理标签树（见「标签树」里的条数）：',
+  '- MERGE_TAG：两条路径**说的是同一件事**，只是层级不同（`项目` 与 `工作/项目`）。',
+  '  合并方向一律是**深的并到浅的**，因为浅的更可能被复用',
+  '- PRUNE_TAG：这棵枝下**只有 0～1 条记忆**，说明分得太细，把它上提到父级',
+  '- 根节点既不合并也不上提；语义确实不同就**别动**——乱合并会把东西塞错地方',
   '',
   '什么时候写关系（**拿不准就不写**）：',
   '- SUPERSEDE：「我住在上海」→「我搬到北京了」，同一件事的新旧版本；',
@@ -73,12 +86,21 @@ export function renderMemoryList(entries: readonly { text: string }[]): string {
   return entries.map((entry, index) => `#${index + 1} ${entry.text}`).join('\n')
 }
 
+/**
+ * 渲染标签树（带条数），供模型判合并与上提。
+ * @param usage - 每条标签的路径与子树条数。
+ */
+export function renderTagTree(usage: readonly { path: string; total: number }[]): string {
+  return usage.map(item => `- ${item.path}（${item.total} 条）`).join('\n')
+}
+
 /** 解析维护输出；坏行直接丢。 */
 export function parseMaintenance(output: string): MaintenanceResult {
   const marks: { turn: number; reason: string }[] = []
-  const remembers: string[] = []
   const tags: string[] = []
+  const remembers: MaintenanceResult['remembers'] = []
   const relations: MaintenanceResult['relations'] = []
+  const tagOps: MaintenanceResult['tagOps'] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
     if (line === '') continue
@@ -101,6 +123,16 @@ export function parseMaintenance(output: string): MaintenanceResult {
       tags.push(tag[1].trim())
       continue
     }
+    const mergeTag = /^MERGE_TAG\s+(\S+)\s+(\S+)$/iu.exec(line)
+    if (mergeTag !== null) {
+      tagOps.push({ op: 'merge', from: mergeTag[1], to: mergeTag[2] })
+      continue
+    }
+    const pruneTag = /^PRUNE_TAG\s+(\S+)$/iu.exec(line)
+    if (pruneTag !== null) {
+      tagOps.push({ op: 'prune', path: pruneTag[1] })
+      continue
+    }
     const relation = /^(MERGE|SUPERSEDE)\s+#?(\d+)\s+#?(\d+)$/iu.exec(line)
     if (relation !== null) {
       const older = Number(relation[2])
@@ -110,5 +142,5 @@ export function parseMaintenance(output: string): MaintenanceResult {
       }
     }
   }
-  return { marks, tags, remembers, relations }
+  return { marks, tags, remembers, relations, tagOps }
 }
