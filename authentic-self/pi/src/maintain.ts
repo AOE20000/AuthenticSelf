@@ -14,6 +14,8 @@
 export interface MaintenanceResult {
   /** 要保护的轮：轮号 + 原因。 */
   marks: { turn: number; reason: string }[]
+  /** 要新建的标签（**一次只能建一层，父级必须已存在**）。 */
+  tags: string[]
   /** 要写进记忆库的事实（带标签路径；没有路径时为未分类）。 */
   remembers: { tagPath?: string; text: string }[]
   /** 记忆之间的关系：编号指向提示词里的记忆清单。 */
@@ -32,6 +34,7 @@ export const MAINTENANCE_RULES = [
   '',
   '输出格式（每行一条，不要其他文字）：',
   'MARK Tn <原因>              ← 这一轮必须原样保留',
+  'TAG <标签路径>                      ← 新建一个标签（**一次只建一层**）',
   'REMEMBER <标签路径> | <一句话事实>   ← 这条值得长期记住，并归到这个标签下',
   'SUPERSEDE <旧编号> <新编号>   ← 旧记忆被新记忆取代（同一事实的新版本）',
   'MERGE <旧编号> <新编号>       ← 旧记忆的信息被新记忆完全包含',
@@ -47,7 +50,10 @@ export const MAINTENANCE_RULES = [
   '- 用户的明确纠正："不是 X，是 Y"',
   '- 不要记录寒暄、过程、一次性细节、以及已经在上面列出的承诺（那些走 MARK）',
   '- **先看记忆清单**：已有等价内容的不要再写；事实变了就写关系（见下），不要另起一条',
-  '- **先用现有的标签**（见「现有标签」）。实在没有合适的，才新建路径，最多三层、每层不超过六个字',
+  '- **先用现有的标签**（见「现有标签」）。能在现有树里找到位置，就不要新建',
+  '- 新建标签有硬规矩：**父级必须已经存在**，一次只能建一层。要建 `a/b` 得先有 `a`，',
+  '  否则这一行会被丢弃——所以先翻现有标签，别急着往下挖',
+  '- 一条标签最多 7 个字（标点不算）。层数不限，但每层都得短',
   '- 拿不准归到哪儿就用 `其他`',
   '',
   '什么时候写关系（**拿不准就不写**）：',
@@ -71,6 +77,7 @@ export function renderMemoryList(entries: readonly { text: string }[]): string {
 export function parseMaintenance(output: string): MaintenanceResult {
   const marks: { turn: number; reason: string }[] = []
   const remembers: string[] = []
+  const tags: string[] = []
   const relations: MaintenanceResult['relations'] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
@@ -89,6 +96,11 @@ export function parseMaintenance(output: string): MaintenanceResult {
       if (text.length >= 4) remembers.push(tagPath === undefined || tagPath === '' ? { text } : { tagPath, text })
       continue
     }
+    const tag = /^TAG\s+(\S+)$/iu.exec(line)
+    if (tag !== null) {
+      tags.push(tag[1].trim())
+      continue
+    }
     const relation = /^(MERGE|SUPERSEDE)\s+#?(\d+)\s+#?(\d+)$/iu.exec(line)
     if (relation !== null) {
       const older = Number(relation[2])
@@ -98,5 +110,5 @@ export function parseMaintenance(output: string): MaintenanceResult {
       }
     }
   }
-  return { marks, remembers, relations }
+  return { marks, tags, remembers, relations }
 }

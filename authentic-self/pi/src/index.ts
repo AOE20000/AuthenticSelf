@@ -501,7 +501,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const text = await summarize(transcript, MAINTENANCE_RULES, budget)
     if (text === undefined) return undefined
 
-    const { marks, remembers, relations } = parseMaintenance(text)
+    const { marks, tags, remembers, relations } = parseMaintenance(text)
     let marked = 0
     for (const mark of marks) {
       const turn = window.find(item => item.index === mark.turn)
@@ -528,6 +528,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       }
     }
 
+    // 先建标签（一次一层，父级不存在会被 ensureTag 拒掉），再写记忆
+    let tagged = 0
+    for (const path of tags) {
+      if (store.ensureTag(path) !== undefined) tagged += 1
+    }
+
     let remembered = 0
     for (const fact of remembers) {
       // 与"记住 X"共用去重口径：已经很像的就不再写
@@ -538,12 +544,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       remembered += 1
     }
 
-    if (marked === 0 && remembered === 0 && related === 0) return undefined
-    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, remember ${remembered}, relate ${related}\n`)
+    if (marked === 0 && tagged === 0 && remembered === 0 && related === 0) return undefined
+    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, tag ${tagged}, remember ${remembered}, relate ${related}\n`)
     return {
       type: 'custom',
       customType: 'as/maint',
-      data: { marked, remembered, related, window: window.length },
+      data: { marked, tagged, remembered, related, window: window.length },
     }
   }
 

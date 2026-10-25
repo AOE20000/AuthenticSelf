@@ -21,10 +21,18 @@ export type EntryState = 'active' | 'merged' | 'superseded' | 'suppressed'
 /** 时近半衰期（天）。参照 Generative Agents 的指数衰减，但以天为单位。 */
 const RECENCY_HALF_LIFE_DAYS = 7
 
-/** 标签树的硬上限：层数、单层字数、总个数。超了就退回"未分类"，不让树长成草丛。 */
-const MAX_TAG_DEPTH = 3
-const MAX_TAG_SEGMENT = 12
-const MAX_TAGS = 200
+/**
+ * 单条标签的字数上限（**不计标点**）。
+ *
+ * 不设层数上限、不设标签总数上限——那是自动归类机制的活。
+ * 但一条标签必须短：长了就不再是"位置"，而是一句描述，树会退化成摘要。
+ */
+const MAX_TAG_CHARS = 7
+
+/** 去掉标点后数长度。中英文标点都算标点。 */
+function textLength(value: string): number {
+  return value.replace(/[\p{P}\p{S}]/gu, '').length
+}
 
 /** 三因子权重。三者归一后等权相加——照 Generative Agents 的做法。 */
 const W_RECENCY = 1
@@ -366,32 +374,27 @@ export class Store {
    */
   ensureTag(path: string): string | undefined {
     const segments = path.split('/').map(part => part.trim()).filter(part => part !== '')
-    if (segments.length === 0 || segments.length > MAX_TAG_DEPTH) return undefined
-    if (segments.some(segment => segment.length > MAX_TAG_SEGMENT)) return undefined
+    if (segments.length === 0) return undefined
+    if (segments.some(segment => textLength(segment) === 0 || textLength(segment) > MAX_TAG_CHARS)) return undefined
 
-    const existing = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(path) as unknown as { id: string } | undefined
+    const full = segments.join('/')
+    const existing = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(full) as unknown as { id: string } | undefined
     if (existing !== undefined) return existing.id
 
-    const count = this.db.prepare('SELECT COUNT(*) AS n FROM tag').get() as unknown as { n: number }
-    if (Number(count.n) >= MAX_TAGS) return undefined
-
+    // **父级不自动创建**：一次只建一层。父不存在就拒绝——
+    // 这迫使调用方先找现成的上级，而不是随手甩出一条四级路径。
     let parent: string | null = null
-    let current = ''
-    let leaf = ''
-    for (const segment of segments) {
-      current = current === '' ? segment : `${current}/${segment}`
-      const row = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(current) as unknown as { id: string } | undefined
-      if (row !== undefined) {
-        leaf = row.id
-        parent = row.id
-        continue
-      }
-      this.counter += 1
-      leaf = `t-${Date.now().toString(36)}-${this.counter}`
-      this.db.prepare('INSERT INTO tag (id, path, parent, created) VALUES (?, ?, ?, ?)').run(leaf, current, parent, Date.now())
-      parent = leaf
+    if (segments.length > 1) {
+      const parentPath = segments.slice(0, -1).join('/')
+      const row = this.db.prepare('SELECT id FROM tag WHERE path = ?').get(parentPath) as unknown as { id: string } | undefined
+      if (row === undefined) return undefined
+      parent = row.id
     }
-    return leaf
+
+    this.counter += 1
+    const id = `t-${Date.now().toString(36)}-${this.counter}`
+    this.db.prepare('INSERT INTO tag (id, path, parent, created) VALUES (?, ?, ?, ?)').run(id, full, parent, Date.now())
+    return id
   }
 
   /** 现有标签路径清单，供旁路挑现成的而不是新建。 */
