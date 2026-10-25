@@ -587,6 +587,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       text: slot.text,
       tag: slot.entry.tag,
       date: dateLabel(slot.entry.tStart),
+      origin: slot.entry.origin,
     }))
     const transcript = [
       '【本轮思考】',

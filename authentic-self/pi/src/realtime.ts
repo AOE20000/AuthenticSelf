@@ -43,8 +43,9 @@ export const REALTIME_RULES = [
   '什么时候 DROP（只用于无关候选）：',
   '- 候选与本轮思考无关，或明显过时且已有新版本',
   '- **同叶矛盾不要 DROP 了事**——那等于把记忆删掉。矛盾走下面的 REWRITE',
-  '- **注意**：记忆里的「我」指**用户本人**——这些是用户的记录，不是主 AI 的自述。',
-  '  「我搬到北京了」= 用户搬到北京了。不要因为「我」就把记忆当成主 AI 的事而丢弃',
+  '- **「我」指谁由来源决定**（来源已标在每个候选上）：',
+  '  来源:user → 用户的话，「我」= 用户；来源:model → 整理后的记录，应为第三人称；',
+  '  来源:external → 按内容判断。含混不构成 DROP 的理由，用 REWRITE 澄清成第三人称',
   '',
   '什么时候 REWRITE（冲突在这里合并，这是你的核心职责）：',
   '- 两条候选**同一片叶**且互相矛盾（如「住在上海」vs「搬到北京」）：',
@@ -58,6 +59,8 @@ export const REALTIME_RULES = [
   '',
   '什么时候 REMEMBER（只记下次还用得上的）：',
   '- 稳定的事实：项目、选型、长期偏好、身份、重要决定',
+  '- **一律用第三人称书写**（「用户…」或主语明确的句子），不写「我」——',
+  '  来源:user 的原话可以保留「我」（那是用户的话），整理产物不要',
   '- 路径写在根 `记忆` 之下（`记忆/用户/住所`），优先复用现有标签；',
   '  一条标签最多 7 个字（标点不算），父级必须已存在，一次建一层',
   '- 拿不准就用 `记忆/其他`；一次性细节、寒暄、过程不要写',
@@ -72,6 +75,8 @@ export interface Candidate {
   text: string
   tag?: string
   date: string
+  /** 来源分层：user=用户的话 / model=整理后的记录 / external=外部输入。决定「我」指谁。 */
+  origin: string
 }
 
 /**
@@ -90,7 +95,7 @@ export function renderCandidates(items: readonly Candidate[]): string {
   for (const [tag, bucket] of groups) {
     lines.push(`[${tag}]`)
     for (const item of bucket) {
-      lines.push(`  #${item.index}（${item.date}）${item.text}`)
+      lines.push(`  #${item.index}（${item.date}｜来源:${item.origin}）${item.text}`)
     }
   }
   return lines.join('\n')
