@@ -1,11 +1,8 @@
 packages:
   - vendor/*
-  - packages/*/*
-  # AuthenticSelf: self infrastructure built beside the frontend.
+  # AuthenticSelf: self infrastructure
   - authentic-self/packages/*
   - authentic-self/bundle
-  # Frontend application (apps/web).
-  - apps/*
 
 overrides:
   'extract-zip>yauzl': '3.4.0'

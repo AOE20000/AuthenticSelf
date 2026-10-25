@@ -15,11 +15,7 @@
     "apps/*",
     "website"
   ],
-  "scripts": {
-    "dev": "pnpm --filter @deepseek-ai/dsh-web-frontend dev",
-    "build": "pnpm --filter @deepseek-ai/dsh-web-frontend build",
-    "typecheck": "tsc -b tsconfig.client.json"
-  },
+  "scripts": {},
   "devDependencies": {
     "@deepseek-ai/dsh-hooks-claude-code": "workspace:*",
     "@deepseek-ai/dsh-hooks-codex": "workspace:*",
@@ -102,5 +98,5 @@
     "@deepseek-ai/dsh-experimental-cua-macos": "workspace:*",
     "@deepseek-ai/dsh-action-cards": "workspace:*"
   },
-  "description": "AuthenticSelf: memory and self infrastructure, built on the DeepSeek Harness frontend"
+  "description": "AuthenticSelf: memory and self infrastructure as a Pi extension"
 }

@@ -1,5 +1,0 @@
-- listitem:
-  - button "Voir Examen des autorisations automatiques": Examen des autorisations automatiques
-  - text: Expérimental Ajoutez un mode d'autorisation Auto review qui utilise le modèle pour évaluer l'autorisation avant chaque appel d'outil.
-  - status
-  - switch "Activer Examen des autorisations automatiques"
