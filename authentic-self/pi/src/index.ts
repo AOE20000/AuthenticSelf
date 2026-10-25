@@ -21,6 +21,14 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
+import {
+  applyCompression,
+  parseBatch,
+  renderBatch,
+  segmentTurns,
+  TURN_RULES,
+  type TurnResult,
+} from './turns'
 
 const flag = (value: string | undefined): boolean => value === '1' || value === 'true'
 
@@ -142,6 +150,10 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const compactMin = Number(process.env.AS_COMPACT_MIN ?? 25000)
   const foldAt = Number(process.env.AS_FOLD_AT ?? 0.6)
   const foldKeep = Number(process.env.AS_FOLD_KEEP ?? 2)
+  const turnBatch = Number(process.env.AS_TURN_BATCH ?? 10)
+  const keepRecent = Number(process.env.AS_KEEP_RECENT ?? 2)
+  const dupPolicy = process.env.AS_DUP === 'drop' ? 'drop' as const : 'placeholder' as const
+  const turnCache = new Map<string, Map<number, TurnResult>>()
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -185,6 +197,68 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     ].join('\n')
   }
 
+  /**
+   * 按轮压缩：全局视野判断重复，按轮原地写回。
+   *
+   * 与之前"整段重压"的区别：写回的最小单元是一轮，所以轮次顺序不变；
+   * 且受保护的轮（工具轮 / 最近几轮 / 用户说别压）只读可见、不会被改。
+   * 分批送给模型，每批最多 `turnBatch` 轮，解析结果按批缓存。
+   * @param messages - 当前发给模型的消息。
+   * @param signal - 取消信号。
+   * @returns 改写后的消息；没有可压的轮或全部失败时 undefined。
+   */
+  async function compressByTurns(
+    messages: readonly unknown[],
+    signal: AbortSignal | undefined,
+  ): Promise<unknown[] | undefined> {
+    const turns = segmentTurns(messages, keepRecent)
+    const candidates = turns.filter(turn => !turn.protected)
+    if (candidates.length < 2) return undefined
+
+    const merged = new Map<number, TurnResult>()
+    let batches = 0
+    for (let offset = 0; offset < candidates.length; offset += turnBatch) {
+      const batch = candidates.slice(offset, offset + turnBatch)
+      const key = batch
+        .map(turn => `${turn.index}:${messages.slice(turn.start, turn.end).map(message => JSON.stringify(message).length).join('.')}`)
+        .join('|')
+      const cached = turnCache.get(key)
+      if (cached !== undefined) {
+        for (const [index, value] of cached) merged.set(index, value)
+        continue
+      }
+      batches += 1
+      const budget = AbortSignal.timeout(Number(process.env.AS_SUMMARY_TIMEOUT ?? 15000))
+      const text = await summarize(
+        renderBatch(messages, batch),
+        `${TURN_RULES}\n\n本批共 ${batch.length} 轮。`,
+        signal === undefined ? budget : AbortSignal.any([signal, budget]),
+      )
+      if (text === undefined) continue
+      const parsed = parseBatch(text)
+      if (parsed.size === 0) continue
+      turnCache.set(key, parsed)
+      for (const [index, value] of parsed) merged.set(index, value)
+    }
+    if (merged.size === 0) return undefined
+
+    const applied = applyCompression(messages, turns, merged, dupPolicy)
+    if (applied === undefined) return undefined
+    state.pendingAudit.push({
+      type: 'custom',
+      customType: 'as/turn_compress',
+      data: { turns: applied.changed, dropped: applied.dropped, batches },
+    })
+    if (debug) process.stderr.write(`[as] turn compress ${applied.changed}/${turns.length} (dropped ${applied.dropped})\n`)
+    if (debug) {
+      for (const message of applied.messages as { content?: { text?: string }[] }[]) {
+        const text = (message.content ?? []).map(block => block.text ?? '').join('')
+        if (text.startsWith('【T')) process.stderr.write(`    ${text.slice(0, 80)}\n`)
+      }
+    }
+    return applied.messages
+  }
+
   // 称重：每次调用前看一眼占用。**不在这里压缩**——在 context 里调 compact 会中断当前请求。
   pi.on('context', async (event, ctx) => {
     const usage = ctx.getContextUsage?.()
@@ -192,6 +266,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const usable = Math.max(1, usage.contextWindow - reserve)
     state.pressure = usage.tokens / usable
     state.tokens = usage.tokens
+
+    // 先试按轮压缩（全局视野 + 按轮写回）；不成立再退回整段纪要或确定性折叠
+    if (state.pressure >= foldAt) {
+      const compressed = await compressByTurns(event.messages, ctx.signal)
+      if (compressed !== undefined) return { messages: compressed }
+    }
 
     // 单 turn 内膨胀时，pi 的压缩动不了（它按 turn 边界切，切不出东西）。
     // 这里由我们自己压：先让旁路模型把较早的部分写成「按轮纪要」，
