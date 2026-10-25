@@ -1,0 +1,22 @@
+{
+  "name": "@authentic-self/pi",
+  "version": "0.0.1",
+  "description": "AuthenticSelf for Pi: memory injection, self-recollection rounds, and forgetting",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "pi": {
+    "extensions": [
+      "src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1"
+  },
+  "files": [
+    "src"
+  ]
+}
