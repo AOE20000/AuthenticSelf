@@ -30,6 +30,14 @@ interface State {
   injected: Set<string>
   /** 本句新写入库的条目，攒到 turn 末写一条审计。 */
   written: string[]
+  /** 攒到 turn 末落盘的审计条目（压缩等事件无法当场追加）。 */
+  pendingAudit: unknown[]
+  /** 上次称重得到的占用比例，用于判断是否要压。 */
+  pressure: number
+  /** 上次称重得到的 token 数。 */
+  tokens: number
+  /** 本次运行是否已经触发过压缩，防重入。 */
+  compacted: boolean
   /** 最近一条 assistant 产出的线索文本。 */
   cue?: { text: string; kind: 'reasoning' | 'fallback' }
 }
@@ -122,6 +130,11 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const enabled = flag(process.env.AS_ENABLED)
   const maxRounds = Number(process.env.AS_MAX_ROUNDS ?? 3)
   const perRecall = Number(process.env.AS_PER_RECALL ?? 2)
+  const compactionOn = process.env.AS_COMPACT !== '0'
+  const reserve = Number(process.env.AS_RESERVE ?? 8192)
+  const compactAt = Number(process.env.AS_COMPACT_AT ?? 0.85)
+  const debug = flag(process.env.AS_DEBUG)
+  const compactMin = Number(process.env.AS_COMPACT_MIN ?? 25000)
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -131,7 +144,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   const store = new Store(process.env.AS_DB || undefined)
-  const state: State = { rounds: 0, injected: new Set(), written: [] }
+  const state: State = { rounds: 0, injected: new Set(), written: [], pendingAudit: [], pressure: 0, tokens: 0, compacted: false }
 
   /** 库为空时播种。仅用于测试，正式形态应由下行旁路写入。 */
   const seed = process.env.AS_SEED
@@ -148,6 +161,54 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
   pi.on('session_start', async (_event, ctx) => {
     notify(ctx, `AuthenticSelf 就绪：${store.count()} 条记忆`, 'info')
+  })
+
+  /** 压缩指令：把"不能丢"的东西点名给摘要器，而不是让它自己猜。 */
+  function compactInstructions(): string {
+    const keep = store.list()
+      .filter(entry => entry.state === 'active' && entry.salience >= 0.8)
+      .slice(0, 5)
+    return [
+      '压缩本段对话，遵守以下约束：',
+      '1. 下列内容必须逐字保留，不得改写、合并或省略：',
+      ...(keep.length > 0 ? keep.map(entry => `   - ${entry.text}`) : ['   （无）']),
+      '2. 未完成的步骤、待办、尚未兑现的承诺，必须保留状态与原措辞。',
+      '3. 已解决的步骤可以合并成一句，不必保留细节。',
+      '4. 不要重写用户原话；引用时保持原句。',
+    ].join('\n')
+  }
+
+  // 称重：每次调用前看一眼占用。**不在这里压缩**——在 context 里调 compact 会中断当前请求。
+  pi.on('context', async (_event, ctx) => {
+    const usage = ctx.getContextUsage?.()
+    if (usage === undefined || typeof usage.tokens !== 'number') return undefined
+    const usable = Math.max(1, usage.contextWindow - reserve)
+    state.pressure = usage.tokens / usable
+    state.tokens = usage.tokens
+    return undefined
+  })
+
+  // 压缩：turn 结束后再动手，避免打断正在飞的请求
+  pi.on('turn_end', async (_event, ctx) => {
+    if (!compactionOn || state.compacted) return
+    if (state.pressure < compactAt || state.tokens < compactMin) return
+    state.compacted = true
+    if (debug) process.stderr.write(`[as] compact trigger at ${(state.pressure * 100).toFixed(1)}%\n`)
+    await new Promise<void>((resolve) => {
+      ctx.compact({
+        customInstructions: compactInstructions(),
+        onComplete: () => {
+          state.pendingAudit.push({ type: 'custom', customType: 'as/compact', data: { ok: true, at: state.pressure } })
+          resolve()
+        },
+        onError: (error) => {
+          state.pendingAudit.push({ type: 'custom', customType: 'as/compact', data: { ok: false, at: state.pressure, error: String(error).slice(0, 120) } })
+          resolve()
+        },
+      })
+      // 没有可压内容时 pi 不回调；给个上限，别把 turn 卡死
+      setTimeout(resolve, 30000)
+    })
   })
 
   pi.on('message_end', async (event) => {
@@ -177,8 +238,9 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   })
 
   pi.on('agent_before_settle', async (event) => {
-    // 本轮写入的审计：不管有没有注入，都要留痕
-    const audit: unknown[] = []
+    // 本轮写入与压缩的审计：不管有没有注入，都要留痕
+    const audit: unknown[] = [...state.pendingAudit]
+    state.pendingAudit = []
     if (state.written.length > 0) {
       audit.push({ type: 'custom', customType: 'as/write', data: { ids: [...state.written] } })
       state.written = []
