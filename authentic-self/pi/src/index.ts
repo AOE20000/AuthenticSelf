@@ -21,7 +21,8 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
-import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList } from './maintain'
+import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
+import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
 import {
   applyCompression,
   parseBatch,
@@ -38,6 +39,8 @@ interface State {
   rounds: number
   /** 本句已注入过的条目，避免重复。 */
   injected: Set<string>
+  /** 本句被实时旁路 DROP 掉的条目——它们不能在后续轮次里再回来。 */
+  dropped: Set<string>
   /** 本句新写入库的条目，攒到 turn 末写一条审计。 */
   written: string[]
   /** 攒到 turn 末落盘的审计条目（压缩等事件无法当场追加）。 */
@@ -165,6 +168,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const maintEvery = Number(process.env.AS_MAINT_EVERY ?? 10)
   const maintWindow = Number(process.env.AS_MAINT_WINDOW ?? 10)
   const maintMemoryWindow = Number(process.env.AS_MAINT_MEMORY ?? 20)
+  const realtimeOn = process.env.AS_REALTIME !== '0'
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -177,6 +181,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const state: State = {
     rounds: 0,
     injected: new Set(),
+    dropped: new Set(),
     written: [],
     pendingAudit: [],
     pressure: 0,
@@ -446,6 +451,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       // 新的用户发言 = 新的回应，轮次与去重集合清零
       state.rounds = 0
       state.injected.clear()
+      state.dropped.clear()
 
       // 每 N 轮排一次维护（节拍按用户发言算，不按步数）
       state.userTurns += 1
@@ -559,6 +565,74 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     }
   }
 
+  /** 实时旁路的工作槽：候选条目 + 编号 + 可能被重写后的文本。 */
+  type Slot = { entry: { id: string; text: string; origin: string; confidence: number; tStart: number; tag?: string }; index: number; text: string }
+
+  /**
+   * 实时旁路：一次调用统一三件事——注入决策（DROP/REWRITE）、冲突合并、写入。
+   *
+   * 失败时返回 undefined，调用方按"全部照常注入"处理：旁路是增强，不是依赖。
+   * @param cueText - 本轮思考的线索文本。
+   * @param current - 当前候选槽。
+   * @returns 过滤后的槽 + 一条审计；旁路没给出任何决策时为 undefined。
+   */
+  async function runRealtime(
+    cueText: string,
+    current: Slot[],
+  ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown } | undefined> {
+    const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
+    const candidates: import('./realtime').Candidate[] = current.map(slot => ({
+      index: slot.index,
+      id: slot.entry.id,
+      text: slot.text,
+      tag: slot.entry.tag,
+      date: dateLabel(slot.entry.tStart),
+    }))
+    const transcript = [
+      '【本轮思考】',
+      cueText.slice(0, 800),
+      '',
+      '【候选记忆】',
+      candidates.length > 0 ? renderCandidates(candidates) : '（无）',
+      '',
+      '【本句已注入（仅供参考，不要对它输出）】',
+      [...state.injected].join('、') || '（无）',
+      '',
+      '【标签树（括号里是子树条数）】',
+      renderTagTree(store.tagUsage()),
+    ].join('\n')
+
+    const budget = AbortSignal.timeout(Number(process.env.AS_REALTIME_TIMEOUT ?? 12000))
+    const text = await summarize(transcript, REALTIME_RULES, budget)
+    if (text === undefined) return undefined
+
+    const { drops, rewrites, remembers } = parseRealtime(text)
+    let remembered = 0
+    for (const fact of remembers) {
+      if (store.findSimilar(fact.text) !== undefined) continue
+      store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath })
+      remembered += 1
+    }
+
+    const dropSet = new Set(drops)
+    const droppedIds = current.filter(slot => dropSet.has(slot.index)).map(slot => slot.entry.id)
+    const slots = current
+      .filter(slot => !dropSet.has(slot.index))
+      .map(slot => ({ ...slot, text: rewrites.get(slot.index) ?? slot.text }))
+
+    if (drops.length === 0 && rewrites.size === 0 && remembered === 0) return undefined
+    if (debug) process.stderr.write(`[as] realtime: drop ${drops.length}, rewrite ${rewrites.size}, remember ${remembered}\n`)
+    return {
+      slots,
+      droppedIds,
+      audit: {
+        type: 'custom',
+        customType: 'as/realtime',
+        data: { candidates: current.length, dropped: drops.length, rewritten: rewrites.size, remembered },
+      },
+    }
+  }
+
   /**
    * 该不该做维护？
    *
@@ -595,16 +669,32 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     const cue = state.cue
     const canInject = state.rounds < maxRounds && cue !== undefined && cue.text.length >= 20
-    const picked = canInject ? store.recall(cue.text, perRecall, state.injected) : []
+    const exclude = new Set([...state.injected, ...state.dropped])
+    // 候选多取一倍交给实时旁路筛；它失败时按原样注入前 perRecall 条
+    const picked = canInject ? store.recall(cue.text, perRecall * 2, exclude) : []
+    let slots: Slot[] = picked.map((entry, index) => ({ entry, index: index + 1, text: entry.text }))
 
-    if (picked.length === 0) {
+    // 实时旁路：一次调用统一"注入决策 / 冲突合并 / 写入"。失败则全部照常注入
+    if (canInject && realtimeOn) {
+      const result = await runRealtime(cue.text, slots)
+      if (result !== undefined) {
+        slots = result.slots
+        // 被 DROP 的条目在本句内不得再回来（否则下一轮召回又会捞起来）
+        for (const id of result.droppedIds) state.dropped.add(id)
+        if (result.audit !== undefined) audit.push(result.audit)
+      }
+    }
+
+    const finalPicked = slots.slice(0, perRecall).map(slot => ({ ...slot.entry, text: slot.text }))
+
+    if (finalPicked.length === 0) {
       return audit.length > 0 ? { entries: audit as never[] } : undefined
     }
 
     state.rounds += 1
-    for (const entry of picked) state.injected.add(entry.id)
+    for (const entry of finalPicked) state.injected.add(entry.id)
 
-    const text = render(picked, state.rounds)
+    const text = render(finalPicked, state.rounds)
     return {
       entries: [
         ...audit,
@@ -614,7 +704,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
           customType: 'as/injection',
           data: {
             round: state.rounds,
-            ids: picked.map(entry => entry.id),
+            ids: finalPicked.map(entry => entry.id),
             cue: cue.kind,
             outcome: event.outcome,
           },
