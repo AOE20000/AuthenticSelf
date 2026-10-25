@@ -79,11 +79,27 @@ export const MAINTENANCE_RULES = [
 ].join('\n')
 
 /**
- * 渲染记忆清单，供模型按编号引用。
+ * 渲染记忆清单，**按标签叶分组**。
+ *
+ * 同一叶子下的条目天然互为版本（叶=槽，槽内按时间排序取现值），
+ * 分组渲染让它们在模型眼里相邻——重复项不用语义匹配就能被看见。
+ * 未挂标签的排到最后，它们彼此无关。
  * @param entries - 待判定的记忆（建议只给 active 的最近若干条）。
  */
-export function renderMemoryList(entries: readonly { text: string }[]): string {
-  return entries.map((entry, index) => `#${index + 1} ${entry.text}`).join('\n')
+export function renderMemoryList(entries: readonly { text?: string; tag?: string }[]): string {
+  const groups = new Map<string, { text?: string; tag?: string }[]>()
+  for (const entry of entries) {
+    const key = entry.tag ?? '（未分类）'
+    const bucket = groups.get(key)
+    if (bucket === undefined) groups.set(key, [entry])
+    else bucket.push(entry)
+  }
+  const ordered = [...groups.entries()].flatMap(([tag, bucket]) =>
+    bucket.map(entry => ({ ...entry, tag })),
+  )
+  return ordered
+    .map((entry, index) => `#${index + 1} [${entry.tag}] ${entry.text ?? ''}`)
+    .join('\n')
 }
 
 /**

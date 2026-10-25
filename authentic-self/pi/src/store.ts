@@ -338,6 +338,13 @@ export class Store {
         return { row, score }
       })
       .sort((left, right) => right.score - left.score)
+      // 同槽只出一条：叶=槽，槽内取现值（时间线天然由叶+时间构成）。
+      // 未挂标签的条目互不相关，不受此限。
+      .filter((item, index, all) => {
+        const leaf = item.row.tag_path
+        if (leaf === null || leaf === undefined) return true
+        return all.findIndex(other => other.row.tag_path === leaf) === index
+      })
       .slice(0, limit)
       .map(item => toEntry(item.row))
   }
