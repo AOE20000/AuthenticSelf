@@ -1,76 +1,60 @@
 # AuthenticSelf
 
-在 [DeepSeek Harness](../../README.md)（`dsh`）之上构建的「自我基础设施」：让主 AI 只处理当前显式上下文，把记忆、调度、整理、反射、门控交给它看不见、也管不着，但一直在影响它的下层。
+一份 **Pi 扩展**：给主 AI 装上一层它看不见、也管不着，却一直在影响它的基础设施。
 
-**核心原则：对主 AI 黑盒，对系统白盒。**
+**核心原则：对主 AI 黑盒，对人白盒。**
 
 ---
+
+## 它做什么
+
+| 能力 | 说明 |
+|---|---|
+| **记忆注入** | 它想到什么，就载入什么，不需要调用工具 |
+| **旁路** | 另一个模型处理"该想起什么、该记住什么"，主 AI 不感知 |
+| **交涉通道** | 它可以提请"删掉这段""改成那样"，但不知道谁在审 |
+| **遗忘** | 单次超长对话不溢出；重要的不动，不重要的只留摘要与索引 |
+| **归档** | 旧会话不再启用，但永远可检索 |
 
 ## 现状
 
 | | |
 |---|---|
-| 设计 | 已定稿（架构 + 隔离两章闭合，20 项设计决策 + 9 项隔离裁定） |
-| 代码 | **未开始**。仓库根没有 `node_modules`，任何未编译的 TypeScript 都是负债 |
-| 首个里程碑 | P0「注入闭环」——验证「先思考 → 注入 → 再思考」在 dsh 上真的成立 |
-
----
+| P0 注入闭环 | ✅ 在 `pi-coding-agent@1.4.0` 上跑通（关掉泛化、开启命中） |
+| 下行写入 | ✅ "记住 X" 写库，另一个进程能召回 |
+| 压缩接管 | 🟡 触发路径通，压缩本体待验 |
+| 交涉通道 / 归档 / 审计链 | ⬜ 见 [开发计划](docs/10-roadmap.md) |
 
 ## 目录
 
 ```
 authentic-self/
+  pi/                  扩展本体（唯一的代码）
+    src/index.ts       钩子：context / agent_before_settle / turn_end
+    src/store.ts       SQLite 记忆库
   docs/
-    source/AuthenticSelf.txt   原始构思与参考讨论（用户提供，未改写；冲突时以此为准）
-    01-architecture.md         架构设计：七单元、双向注入、遗忘与归档、数据表、分期
-    02-isolation.md            隔离的逻辑：四权限 × 十一边界、九项裁定、硬不变量
-    03-p0-plan.md              P0 开发计划：T1–T6，含一处已验证的技术风险
-  packages/                    代码（尚未创建，见 03-p0-plan.md 的目录布局）
-  bundle/                      组合层（尚未创建，dsh profile 的唯一入口）
+    source/            原始构思（冲突时以此为准）
+    01-architecture.md 架构与 20 项决策
+    02-isolation.md    隔离：谁看得见谁
+    03-p0-plan.md      P0 验收与三次实测记录
+    04～09             换基座审计、遗忘方案、文档检查、跨平台、扩展路线、参考对照
+    10-roadmap.md      开发计划（M0–M5）
+  README.md            本文件
 ```
 
----
+## 运行
 
-## 三条不该被推翻的边界
-
-1. **"潜意识"不是组件。** 它只是灵感与开放透镜，不进入组件命名、因果解释、评估指标。
-2. **对主 AI 只暴露两个原语**：`memory_intent` 与 `change_intent`。其余零工具。
-3. **旁路只建议，代码服务才执行。** 旁路失败降级为「无记忆」，代码服务失败则熔断。
-
-更完整的不变量见 [02-isolation.md](docs/02-isolation.md) 第 5 节（L0 不可变、外部/导入来源不得直接改 L1/L2、`origin` 不可被自述覆盖）。
-
----
-
-## 与 dsh 的关系
-
-- 本仓库是 `deepseek-ai/deepseek-harness` 的 fork：`upstream` 指向上游，`origin` 指向本项目。
-- **不改 `packages/`。** 已核实所需机制全部存在（`agent/turn-stopping` + `inject()`、`registerMessageProjection()`、`storageDomain`、`subagents`），无需改宿主。
-- AuthenticSelf 的代码放在 `packages/` 之外，避免继承仓库的 100% 单文件覆盖率与包 README 契约门禁；通过 `pnpm-workspace.yaml` 的 `authentic-self/*` 加入工作区（该条目在 P0 的 T1 加入）。
-
----
-
-## 开发下一步
-
-**环境（必读）**：dsh 要求 Node ≥ 24.9，但本机默认 `node` 是 v22。Node 24.15 在 `/e/Scoop/apps/nodejs-lts/current/`，跑任何 pnpm 命令前先：
+扩展由宿主加载，自身不启动：
 
 ```sh
-export PATH="/e/Scoop/apps/nodejs-lts/current:$PATH"
+# pi CLI
+pi --extension ./authentic-self/pi/src/index.ts "你好"
+
+# 环境变量
+AS_ENABLED=1          启用（默认关）
+AS_MAX_ROUNDS=3       每句用户发言内最多注入几轮
+AS_PER_RECALL=2       每轮最多几条
+AS_DB=...             库文件路径（默认 $PI_HOME/agent/authentic-self/memory.db）
 ```
 
-前置：`pnpm install`（首次约 20 分钟）→ `pnpm run build:artifacts`，并准备可用的 `DEEPSEEK_API_KEY`。
-
-然后按 [03-p0-plan.md](docs/03-p0-plan.md) 执行 T1 → T2。**T2 是唯一的硬门槛**：它不过，后面的设计全部作废。
-
----
-
-## 文档关系
-
-```
-source/AuthenticSelf.txt   原始意图（最高权威）
-        │
-        ├── 01-architecture.md   怎么建
-        ├── 02-isolation.md      谁能看/写/裁决/影响谁
-        └── 03-p0-plan.md        先建哪一块、怎么算建成了
-```
-
-`01` 与 `02` 冲突时以 `02` 为准（隔离是更底层的约束）；两者与 `source` 冲突时以 `source` 为准。
+宿主可选：`pi` CLI（终端）、Aether（Android/iOS/macOS）、其他 Pi 发行版。
