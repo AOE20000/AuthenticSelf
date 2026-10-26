@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS pending_change (
   status     TEXT NOT NULL DEFAULT 'pending',
   verdict_reason TEXT NOT NULL DEFAULT '',
   apply_at   INTEGER NOT NULL DEFAULT 0,
+  apply_turn INTEGER NOT NULL DEFAULT 0,
   created    INTEGER NOT NULL,
   decided    INTEGER
 );
@@ -274,6 +275,10 @@ export class Store {
     }
     if (!columns.some(column => column.name === 'last_used')) {
       this.db.exec('ALTER TABLE memory_entry ADD COLUMN last_used INTEGER')
+    }
+    const changeColumns = this.db.prepare('PRAGMA table_info(pending_change)').all() as unknown as { name: string }[]
+    if (!changeColumns.some(column => column.name === 'apply_turn')) {
+      this.db.exec('ALTER TABLE pending_change ADD COLUMN apply_turn INTEGER NOT NULL DEFAULT 0')
     }
     const anchorColumns = this.db.prepare('PRAGMA table_info(anchor)').all() as unknown as { name: string }[]
     if (!anchorColumns.some(column => column.name === 'replaced_by')) {
@@ -875,10 +880,11 @@ export class Store {
     status: string
     verdictReason: string
     applyAt: number
+    applyTurn: number
     created: number
   }[] {
     const base = `SELECT id, kind, anchor_id, old_text, new_text, reason, risk, reflection, normalized,
-      status, verdict_reason, apply_at, created FROM pending_change`
+      status, verdict_reason, apply_at, apply_turn, created FROM pending_change`
     const rows = status === undefined
       ? this.db.prepare(`${base} ORDER BY created DESC`).all()
       : this.db.prepare(`${base} WHERE status = ? ORDER BY created DESC`).all(status)
@@ -895,6 +901,7 @@ export class Store {
       status: string
       verdict_reason: string
       apply_at: number
+      apply_turn: number
       created: number
     }[]).map(row => ({
       id: row.id,
@@ -915,6 +922,7 @@ export class Store {
       status: row.status,
       verdictReason: row.verdict_reason,
       applyAt: Number(row.apply_at),
+      applyTurn: Number(row.apply_turn),
       created: Number(row.created),
     }))
   }
@@ -930,22 +938,33 @@ export class Store {
     id: string,
     verdict: 'approve' | 'reject' | 'clarify',
     reason: string,
-    options: { risk?: 'routine' | 'major'; applyAt?: number } = {},
+    options: { risk?: 'routine' | 'major'; applyAt?: number; applyTurn?: number } = {},
   ): boolean {
     const status = verdict === 'approve' ? 'approved' : verdict === 'reject' ? 'rejected' : 'clarify'
     const result = this.db
       .prepare(`UPDATE pending_change SET status = ?, verdict_reason = ?, risk = COALESCE(?, risk),
-        apply_at = ?, decided = ? WHERE id = ? AND status = 'pending'`)
-      .run(status, reason, options.risk ?? null, options.applyAt ?? 0, Date.now(), id)
+        apply_at = ?, apply_turn = ?, decided = ? WHERE id = ? AND status = 'pending'`)
+      .run(status, reason, options.risk ?? null, options.applyAt ?? 0, options.applyTurn ?? 0, Date.now(), id)
     return Number(result.changes) > 0
   }
 
-  /** 冷却已到期、可以落库的申请。 */
-  dueChanges(now = Date.now()): { id: string; anchorId: string; newText: string; risk: string; normalized: string }[] {
+  /**
+   * 冷却已到期、可以落库的申请。
+   *
+   * 冷却有**两个维**（`01` §7.4 写的是"N 轮**或** N 小时"）：这里取**两者都满足**——
+   * 时间到了但轮次没到，说明用户还没在这个话题上再待过，等它；反之亦然。
+   * 保守取交集，因为错误通过的代价更高。
+   * @param now - 当前时间戳。
+   * @param turn - 当前会话的累计轮次；省略时不看轮次维。
+   */
+  dueChanges(
+    now = Date.now(),
+    turn = Number.POSITIVE_INFINITY,
+  ): { id: string; anchorId: string; newText: string; risk: string; normalized: string }[] {
     const rows = this.db
       .prepare(`SELECT id, anchor_id, new_text, risk, normalized FROM pending_change
-        WHERE status = 'approved' AND apply_at <= ? ORDER BY created`)
-      .all(now) as unknown as { id: string; anchor_id: string; new_text: string; risk: string; normalized: string }[]
+        WHERE status = 'approved' AND apply_at <= ? AND apply_turn <= ? ORDER BY created`)
+      .all(now, turn) as unknown as { id: string; anchor_id: string; new_text: string; risk: string; normalized: string }[]
     return rows.map(row => ({
       id: row.id,
       anchorId: row.anchor_id,
@@ -996,7 +1015,7 @@ export class Store {
     if (decision === 'approve') {
       if (row.status !== 'approved' && row.status !== 'pending') return false
       this.db
-        .prepare("UPDATE pending_change SET status = 'approved', apply_at = 0, verdict_reason = ? WHERE id = ?")
+        .prepare("UPDATE pending_change SET status = 'approved', apply_at = 0, apply_turn = 0, verdict_reason = ? WHERE id = ?")
         .run('人工批准', id)
       return this.applyChange(id) !== undefined
     }

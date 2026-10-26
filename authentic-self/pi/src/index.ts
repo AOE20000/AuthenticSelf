@@ -182,6 +182,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const linkBudget = Number(process.env.AS_LINK_BUDGET ?? 2)
   // 长条目注入的硬上限：选 full 却超过它，只能降级为节选（§5.2）
   const longBudget = Number(process.env.AS_LONG_BUDGET ?? 1200)
+  // 冷却的**轮次维**（§7.4 写的是"N 轮或 N 小时"，两个维都要满足）
+  const cooldownTurns = Number(process.env.AS_CHANGE_COOLDOWN_TURNS ?? 2)
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -443,9 +445,11 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const cooldown = verdict.risk === 'major'
       ? Number(process.env.AS_CHANGE_COOLDOWN_MIN ?? 10) * 60_000
       : 0
+    const turnNow = Number(store.getMeta('turn_total') ?? 0)
     store.judgeChange(id, verdict.verdict, verdict.reason, {
       risk: verdict.risk,
       applyAt: verdict.verdict === 'approve' ? Date.now() + cooldown : 0,
+      applyTurn: verdict.verdict === 'approve' ? turnNow + cooldownTurns : 0,
     })
 
     state.pendingAudit.push({
@@ -807,6 +811,9 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       state.userTurns += 1
       if (maintEvery > 0 && state.userTurns % maintEvery === 0) state.pendingMaintenance = true
 
+      // 累计轮次：冷却的轮次维用它（§7.4）
+      store.setMeta('turn_total', String(Number(store.getMeta('turn_total') ?? 0) + 1))
+
       // 下行写入：只认显式句式（"记住 X"），其余交给旁路判断
       for (const fact of extractExplicit(plainText(event.message))) {
         const existing = store.findSimilar(fact)
@@ -1045,7 +1052,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const contextMessages = (event.context as { contextMessages?: unknown[] } | undefined)?.contextMessages ?? []
 
     // 冷却到期的获批改动在这里落库：**审批者判、代码执行、人可撤销**
-    for (const due of store.dueChanges()) {
+    const turnTotal = Number(store.getMeta('turn_total') ?? 0)
+    for (const due of store.dueChanges(Date.now(), turnTotal)) {
       const applied = store.applyChange(due.id)
       if (applied === undefined) continue
       audit.push({
