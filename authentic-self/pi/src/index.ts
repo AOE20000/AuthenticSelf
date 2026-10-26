@@ -26,7 +26,7 @@ import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
 import { l0Digest, renderAnchors } from './anchors'
 import { INTENT_RULES, parseIntent } from './intent'
-import { readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
+import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
 import {
   applyCompression,
@@ -360,14 +360,14 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     handler: async (args: string, ctx: unknown) => {
       const key = (args ?? '').trim()
       const refs = store.archiveRefs()
-      // 非日期参数 = 备注检索（与时间检索并列的另一个入口）
-      if (key !== '' && !/^\d{4}(-\d{2}){0,2}$/u.test(key)) {
+      // 不是时间粒度 = 备注检索（与时间检索并列的另一个入口）
+      if (key !== '' && grainOf(key).grain === 'all') {
         const counts = new Map<string, number>()
         for (const ref of refs) counts.set(ref.sessionFile, (counts.get(ref.sessionFile) ?? 0) + 1)
         notify(ctx, renderNoteSearch(store.listNotes(), key, counts), 'info')
         return
       }
-      notify(ctx, renderArchiveView(refs, key), 'info')
+      notify(ctx, await renderArchiveView(refs, key, ref => readExcerpt(ref.sessionFile, ref.turnTs, 400)), 'info')
     },
   })
 
@@ -390,41 +390,19 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     name: 'archive',
     label: 'archive',
     description:
-      '查看被移出上下文的归档。必须逐级下钻：不给 key 看年份，给 2026 看月份，'
-      + '给 2026-10 看日期，给 2026-10-26 看条目；再加 read 序号取回原文片段。',
+      '查看被移出上下文的归档。检索是分阶段的：不给 key 返回"哪几年有结果"，'
+      + '给 2026 返回月份，给 2026-10 返回周，给 2026-W44 返回天，给 2026-10-26 返回时，'
+      + '给 2026-10-26T14 才给片段；命中过少时会直接给片段。',
     parameters: Type.Object({
-      key: Type.Optional(Type.String({ description: '时间粒度：2026 / 2026-10 / 2026-10-26' })),
-      read: Type.Optional(Type.Number({ description: '取第几条原文，只在给到日期时可用' })),
+      key: Type.Optional(Type.String({ description: '时间粒度：2026 / 2026-10 / 2026-W44 / 2026-10-26 / 2026-10-26T14' })),
     }),
-    async execute(_toolCallId: string, params: { key?: string; read?: number }) {
-      const key = (params.key ?? '').trim()
-      const refs = store.archiveRefs()
-      if (params.read !== undefined) {
-        // 强制分阶段：不给日期不给原文，避免一次性展开
-        if (!/^\d{4}-\d{2}-\d{2}$/u.test(key)) {
-          return {
-            content: [{ type: 'text' as const, text: '取原文需要先下钻到具体日期（如 2026-10-26），并给出条目序号。' }],
-            details: {},
-          }
-        }
-        const sameDay = refs.filter(ref => {
-          const date = new Date(ref.turnTs)
-          const pad = (value: number): string => String(value).padStart(2, '0')
-          return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` === key
-        })
-        const target = sameDay[params.read - 1]
-        if (target === undefined) {
-          return {
-            content: [{ type: 'text' as const, text: `${key} 没有第 ${params.read} 条。先不带 read 看清单。` }],
-            details: {},
-          }
-        }
-        const excerpt = await readExcerpt(target.sessionFile, target.turnTs, 600)
-        const head = `原文（${target.title}，${target.chars} 字）：`
-        return { content: [{ type: 'text' as const, text: `${head}
-${excerpt}` }], details: {} }
-      }
-      return { content: [{ type: 'text' as const, text: renderArchiveView(refs, key) }], details: {} }
+    async execute(_toolCallId: string, params: { key?: string }) {
+      const text = await renderArchiveView(
+        store.archiveRefs(),
+        params.key ?? '',
+        ref => readExcerpt(ref.sessionFile, ref.turnTs, 400),
+      )
+      return { content: [{ type: 'text' as const, text }], details: {} }
     },
   })
 

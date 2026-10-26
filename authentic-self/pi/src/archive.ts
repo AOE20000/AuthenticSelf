@@ -1,8 +1,18 @@
 /**
- * 归档检视：按时间分阶段下钻（所有 → 年 → 月 → 日）。
+ * 归档检索：**强制分阶段**（source §7.2）。
  *
- * 依据 `03` 的索引区与 M3：不给"一次性展开全部"，每层只回答"哪一段有东西"；
- * 某层命中 ≤3 条时直接给片段——再分下去没有意义。
+ * 规则不是"拒绝"，而是**粒度钳制**——问到哪一层，就只返回下一层的"哪里有结果"：
+ *
+ * ```
+ * 所有   → 哪几年有结果
+ * 年     → 哪些月有结果
+ * 月     → 哪些周有结果
+ * 周     → 哪些天有结果
+ * 天     → 哪些时有结果
+ * 时     → 具体片段
+ * ```
+ *
+ * 任何一层命中过少（≤3）就直接给片段——"不机械下钻"（§7.3）。
  */
 
 /** 一条归档指针。 */
@@ -13,67 +23,135 @@ export interface ArchiveRef {
   sessionFile: string
 }
 
-/** 当值拆成可分组的时间片。 */
-function partsOf(timestamp: number): { year: string; month: string; day: string; time: string } {
+/** 粒度：从粗到细。 */
+export type Grain = 'all' | 'year' | 'month' | 'week' | 'day' | 'hour'
+
+/** 一个时间戳在各级粒度下的标签。 */
+interface Slots {
+  year: string
+  month: string
+  week: string
+  day: string
+  hour: string
+  time: string
+}
+
+const pad = (value: number): string => String(value).padStart(2, '0')
+
+/**
+ * ISO 周：`2026-W43`。
+ * @param date - 目标日期。
+ */
+function isoWeek(date: Date): string {
+  const probe = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
+  const weekday = probe.getUTCDay() === 0 ? 7 : probe.getUTCDay()
+  probe.setUTCDate(probe.getUTCDate() + 4 - weekday)
+  const yearStart = new Date(Date.UTC(probe.getUTCFullYear(), 0, 1))
+  const week = Math.ceil(((probe.getTime() - yearStart.getTime()) / 86_400_000 + 1) / 7)
+  return `${probe.getUTCFullYear()}-W${pad(week)}`
+}
+
+/** 把时间戳拆成各级标签。 */
+function slotsOf(timestamp: number): Slots {
   const date = new Date(timestamp)
-  const pad = (value: number): string => String(value).padStart(2, '0')
   return {
     year: String(date.getFullYear()),
     month: `${date.getFullYear()}-${pad(date.getMonth() + 1)}`,
+    week: isoWeek(date),
     day: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    hour: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}`,
     time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
   }
 }
 
-/** 单条明细节。 */
+/**
+ * 判断查询落在哪一层。
+ * @param key - 查询键；空串表示"所有"。
+ */
+export function grainOf(key: string): { grain: Grain; value: string } {
+  const trimmed = key.trim()
+  if (trimmed === '') return { grain: 'all', value: '' }
+  if (/^\d{4}$/u.test(trimmed)) return { grain: 'year', value: trimmed }
+  if (/^\d{4}-\d{2}$/u.test(trimmed)) return { grain: 'month', value: trimmed }
+  if (/^\d{4}-W\d{2}$/u.test(trimmed)) return { grain: 'week', value: trimmed }
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(trimmed)) return { grain: 'day', value: trimmed }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}$/u.test(trimmed)) return { grain: 'hour', value: trimmed }
+  return { grain: 'all', value: '' }
+}
+
+/** 当前层用哪个字段过滤（all 层不过滤）。 */
+const SELF: Record<Grain, keyof Slots | undefined> = {
+  all: undefined,
+  year: 'year',
+  month: 'month',
+  week: 'week',
+  day: 'day',
+  hour: 'hour',
+}
+
+/** 下一层按哪个字段分组。 */
+const NEXT: Record<Exclude<Grain, 'hour'>, keyof Slots> = {
+  all: 'year',
+  year: 'month',
+  month: 'week',
+  week: 'day',
+  day: 'hour',
+}
+
+/** 单条明细。 */
 function detailOf(ref: ArchiveRef): string {
-  const { day, time } = partsOf(ref.turnTs)
+  const { day, time } = slotsOf(ref.turnTs)
   const file = ref.sessionFile.split(/[\\/]/u).pop() ?? ''
   return `  ${day} ${time}｜${ref.title}（${ref.chars} 字）｜${file}`
 }
 
-/** 按某个粒度分组；桶数 ≤3 时直接给明细。 */
-function groupBy(refs: readonly ArchiveRef[], pick: (value: ReturnType<typeof partsOf>) => string): string {
+/**
+ * 渲染归档视图（粒度钳制，不拒绝）。
+ * @param refs - 全部归档指针。
+ * @param key - 查询键，会按 §7.2 钳到对应层。
+ * @param excerpt - 取片段的能力；只在"时"层或命中过少时用。
+ * @returns 给人看的文本。
+ */
+export async function renderArchiveView(
+  refs: readonly ArchiveRef[],
+  key: string,
+  excerpt: (ref: ArchiveRef) => Promise<string>,
+): Promise<string> {
+  if (refs.length === 0) return '归档里还没有东西——压缩发生过才会留下指针。'
+
+  const { grain, value } = grainOf(key)
+  const selfField = SELF[grain]
+  const scope = selfField === undefined ? refs : refs.filter(ref => slotsOf(ref.turnTs)[selfField] === value)
+  if (scope.length === 0) return `「${key.trim() || '所有'}」下没有归档。`
+
+  const heading = grain === 'all' ? '所有归档' : key.trim()
+
+  // 命中过少 → 直接给片段，不机械下钻（§7.3）。"时"层本来该给片段。
+  if (grain === 'hour' || scope.length <= 3) {
+    const picks = scope.slice(0, 3)
+    const parts = await Promise.all(picks.map(async ref => `${detailOf(ref)}\n${await excerpt(ref)}`))
+    const reason = grain === 'hour' ? `${scope.length} 段` : `只有 ${scope.length} 段，直接给片段`
+    return `${heading}：${reason}\n${parts.join('\n\n')}`
+  }
+
+  const nextField = NEXT[grain]
   const groups = new Map<string, ArchiveRef[]>()
-  for (const ref of refs) {
-    const label = pick(partsOf(ref.turnTs))
+  for (const ref of scope) {
+    const label = slotsOf(ref.turnTs)[nextField]
     const bucket = groups.get(label)
     if (bucket === undefined) groups.set(label, [ref])
     else bucket.push(ref)
   }
   const ordered = [...groups.entries()].sort((left, right) => right[0].localeCompare(left[0]))
-  if (ordered.length <= 3) {
-    return ordered.map(([label, items]) => `${label}：\n${items.map(detailOf).join('\n')}`).join('\n')
+  const body = ordered.map(([label, items]) => `${label}：${items.length} 段`).join('\n')
+  const hint: Record<Exclude<Grain, 'hour'>, string> = {
+    all: '再问「年份」看月份',
+    year: '再问「年-月」看周',
+    month: '再问「年-W周」看天',
+    week: '再问「年-月-日」看时',
+    day: '再问「年-月-日T时」取片段',
   }
-  return ordered.map(([label, items]) => `${label}：${items.length} 条`).join('\n')
-}
-
-/**
- * 渲染归档视图。
- * @param refs - 全部归档指针。
- * @param key - 空=按年；`2026`=按月；`2026-10`=按日；`2026-10-26`=给明细。
- * @returns 给人看的文本。
- */
-export function renderArchiveView(refs: readonly ArchiveRef[], key: string): string {
-  if (refs.length === 0) return '归档里还没有东西——压缩发生过才会留下指针。'
-
-  const trimmed = key.trim()
-  if (trimmed === '') {
-    return `归档共 ${refs.length} 条。按年看：\n${groupBy(refs, value => value.year)}\n\n再问「/as-archive 年份」看月份。`
-  }
-  if (/^\d{4}$/u.test(trimmed)) {
-    const filtered = refs.filter(ref => partsOf(ref.turnTs).year === trimmed)
-    if (filtered.length === 0) return `${trimmed} 年没有归档。`
-    return `${trimmed} 年：\n${groupBy(filtered, value => value.month)}`
-  }
-  if (/^\d{4}-\d{2}$/u.test(trimmed)) {
-    const filtered = refs.filter(ref => partsOf(ref.turnTs).month === trimmed)
-    if (filtered.length === 0) return `${trimmed} 没有归档。`
-    return `${trimmed}：\n${groupBy(filtered, value => value.day)}`
-  }
-  const filtered = refs.filter(ref => partsOf(ref.turnTs).day === trimmed)
-  if (filtered.length === 0) return `${trimmed} 没有归档。可以用 /as-archive 看年份。`
-  return `${trimmed}：\n${filtered.map(detailOf).join('\n')}`
+  return `${heading}：共 ${scope.length} 段。\n${body}\n\n${hint[grain]}。`
 }
 
 /** 一条备注（挂在会话上，不是挂在某条对话上）。 */
@@ -89,7 +167,7 @@ export interface NoteRef {
  * **只匹配备注文本，不碰对话正文**——否则就成了变相全文搜索。
  * @param notes - 全部备注。
  * @param keyword - 关键词。
- * @param counts - 每个会话被移出的条数（用来显示"这条备注视话里有多少东西"）。
+ * @param counts - 每个会话被移出的段数。
  * @returns 给人看的文本。
  */
 export function renderNoteSearch(
@@ -103,7 +181,7 @@ export function renderNoteSearch(
   }
   return hits
     .map(note => {
-      const file = note.sessionFile.split(/[\\/]/u).pop() ?? ''
+      const file = note.sessionFile.split(/[\/]/u).pop() ?? ''
       const count = counts.get(note.sessionFile) ?? 0
       return `- ${note.text}\n  ↳ ${file}（该会话有 ${count} 段被移出）`
     })
