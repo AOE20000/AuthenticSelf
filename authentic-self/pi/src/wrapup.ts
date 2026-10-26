@@ -3,14 +3,9 @@
  *
  * 一次调用做三件同时机的事——它们共享同一份 turn 上下文，且都不阻塞：
  *
- * | 事 | 判据 | 产物 |
- * |---|---|---|
- * | 判用 | 上一轮注入的记忆**有没有被真的用到** | `USED <编号>` |
- * | 预取 | 下一轮可能要用到哪几条记忆 | `PREFETCH <编号> …` |
- *
- * **沉淀不在这里做**（实测教训）：同一 turn 里实时旁路已看过思考并写过一次，
- * 收尾再写一遍只会在措辞改写上产生一堆同义副本（`findSimilar` 0.82 拦不住改写）。
- * 写入只有一个入口：实时旁路（它看得到思考，这是收尾调用拿不到的材料）。
+ * 阶段制：**阶段一只读不写**（注入决策 + 判用），标记完成后才开阶段二——
+ * 阶段二就是这里，做**沉淀 + 预取**。同一时刻只有一条写入路径，所以不会出现
+ * "实时旁路写一次、收尾再写一次"的同义副本问题。
  *
  * 为什么这三件能合、而上行与下行不能合（见 `01` §5.5）：上行必须阻塞在 step 之间，
  * 晚一轮就答偏了；这三件都在 turn 结束后发生，早一步反而拿不到答案。
@@ -18,20 +13,21 @@
 
 /** 一次收尾调用的产物。 */
 export interface WrapupResult {
-  /** 被用到的注入条目编号（指向"待判注入"清单）。 */
-  used: number[]
+  /** 值得长期留下的事实（带来源）。 */
+  remembers: { origin: 'user' | 'model'; tagPath?: string; text: string }[]
   /** 下一轮预取的候选编号（指向"候选记忆"清单）。 */
   prefetch: number[]
 }
 
 /** 收尾调用的任务书。 */
 export const WRAPUP_RULES = [
-  '这一轮结束了。你要做两件事，用同一份材料：本轮问答、上一轮的注入清单、候选记忆清单。',
+  '这一轮结束了。你要做两件事，用同一份材料：本轮问答与候选记忆清单。',
   '',
-  '一、判用：上一次注入的记忆，这一轮的回答里**真的用到**了哪几条？',
-  '   USED <编号>',
-  '   - 只有回答里实际体现了它的内容才算；只是"相关"不算',
-  '   - 被注入但没用到的，什么都不写——那才是常态',
+  '一、沉淀：这段对话里有没有**值得长期记住**的事实？',
+  '   REMEMBER <user|model> <标签路径> | <一句话事实>',
+  '   - user = 用户明确说过的事；model = 你自己总结/推断的。把推断写成 user 是幻觉的第一步',
+  '   - 稳定的事实：项目、选型、长期偏好、身份、重要决定。一次性细节、寒暄、过程不要写',
+  '   - 一律用第三人称书写；标签 ≤7 字，父级必须已存在，一次建一层；拿不准用「其他」',
   '',
   '二、预取：下一轮**很可能**要用到哪几条记忆？',
   '   PREFETCH <编号> [<编号>...]',
@@ -46,14 +42,19 @@ export const WRAPUP_RULES = [
  * @param output - 旁路原文。
  */
 export function parseWrapup(output: string): WrapupResult {
-  const result: WrapupResult = { used: [], prefetch: [] }
+  const result: WrapupResult = { remembers: [], prefetch: [] }
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
     if (line === '') continue
 
-    const used = /^USED\s+(.+)$/iu.exec(line)
-    if (used !== null) {
-      for (const match of used[1].matchAll(/#?(\d+)/gu)) result.used.push(Number(match[1]))
+    const remember = /^REMEMBER\s+(user|model)\s+(?:([^|]+?)\s*\|\s*)?(.+)$/iu.exec(line)
+    if (remember !== null) {
+      const origin = remember[1].toLowerCase() === 'user' ? 'user' : 'model'
+      const tagPath = remember[2]?.trim()
+      const text = remember[3]?.trim() ?? ''
+      if (text.length >= 4) {
+        result.remembers.push(tagPath === undefined || tagPath === '' ? { origin, text } : { origin, tagPath, text })
+      }
       continue
     }
 

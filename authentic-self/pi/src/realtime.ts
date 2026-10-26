@@ -20,8 +20,10 @@ export interface RealtimeResult {
   drops: number[]
   /** 重写后注入：编号 → 新文本。 */
   rewrites: Map<number, string>
-  /** 要写入的事实（带标签路径与来源）。 */
+  /** 要写入的事实（阶段二已接管，这里保留以兼容旧输出）。 */
   remembers: { tagPath?: string; text: string; origin?: 'user' | 'model' }[]
+  /** 上一轮注入里被真正用到的编号（指向"上轮注入"清单）。 */
+  usages: number[]
 }
 
 /**
@@ -38,7 +40,6 @@ export const REALTIME_RULES = [
   '输出格式（每行一条；全部可省略——没有要改的就什么都不输出）：',
   'DROP <编号>                    ← 这条本轮不该注入',
   'REWRITE <编号> | <新文本>       ← 重写后再注入',
-  'REMEMBER <user|model> <标签路径> | <一句话事实>   ← 写入长期记忆（第一项是来源）',
   '',
   '什么时候 DROP（只用于无关候选）：',
   '- 候选与本轮思考无关，或明显过时且已有新版本',
@@ -57,15 +58,12 @@ export const REALTIME_RULES = [
   '- 单条候选过时但有沿革可讲（「以前 X，现在 Y」），也用 REWRITE，不要直接丢',
   '- 与本轮思考无关的重写没有必要，不要为了改而改',
   '',
-  '什么时候 REMEMBER（只记下次还用得上的）：',
-  '- 稳定的事实：项目、选型、长期偏好、身份、重要决定',
-  '- **来源必须分清**：用户明确说过的事 → `user`；你自己总结、推断、归纳出来的 → `model`。',
-  '  把推断写成 user 是幻觉固化的第一步，宁可用 model',
-  '- **一律用第三人称书写**（「用户…」或主语明确的句子），不写「我」——',
-  '  来源:user 的原话可以保留「我」（那是用户的话），整理产物不要',
-  '- 路径写在根 `记忆` 之下（`记忆/用户/住所`），优先复用现有标签；',
-  '  一条标签最多 7 个字（标点不算），父级必须已存在，一次建一层',
-  '- 拿不准就用 `记忆/其他`；一次性细节、寒暄、过程不要写',
+  '**这一阶段只读不写**：不新增记忆、不改记忆状态。写入在 turn 结束后的阶段二进行。',
+  '',
+  '顺带判用：上一轮注入的记忆，在上一次回答里**真的被用到**了哪几条？',
+  '   USED <编号>          ← 编号指向「上轮注入」清单',
+  '   - 只有回答里实际体现了它的内容才算；只是"相关"不算',
+  '   - 被注入但没用到的不用写——那才是常态',
   '',
   '编号只对候选清单有效；已注入清单仅供参考，不要对它输出 DROP/REWRITE。',
 ].join('\n')
@@ -108,6 +106,7 @@ export function parseRealtime(output: string): RealtimeResult {
   const drops: number[] = []
   const rewrites = new Map<number, string>()
   const remembers: RealtimeResult['remembers'] = []
+  const usages: number[] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
     if (line === '') continue
@@ -122,6 +121,11 @@ export function parseRealtime(output: string): RealtimeResult {
       if (text !== '') rewrites.set(Number(rewrite[1]), text)
       continue
     }
+    const used = /^USED\s+(.+)$/iu.exec(line)
+    if (used !== null) {
+      for (const match of used[1].matchAll(/#?(\d+)/gu)) usages.push(Number(match[1]))
+      continue
+    }
     const remember = /^REMEMBER\s+(user|model)\s+(?:([^|]+?)\s*\|\s*)?(.+)$/iu.exec(line)
     if (remember !== null) {
       const origin = remember[1].toLowerCase() === 'user' ? 'user' : 'model'
@@ -132,5 +136,5 @@ export function parseRealtime(output: string): RealtimeResult {
       }
     }
   }
-  return { drops, rewrites, remembers }
+  return { drops, rewrites, remembers, usages }
 }

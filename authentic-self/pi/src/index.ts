@@ -54,6 +54,8 @@ interface State {
   lastUserText: string
   /** 已经收尾过的 turnIndex，避免多步注入时重复收尾。 */
   wrapupTurn: number
+  /** 上一次的完整回答：阶段一判用要用它。 */
+  lastAnswer: string
   /** 本句新写入库的条目，攒到 turn 末写一条审计。 */
   written: string[]
   /** 攒到 turn 末落盘的审计条目（压缩等事件无法当场追加）。 */
@@ -181,6 +183,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     dropped: new Set(),
     lastUserText: '',
     wrapupTurn: -1,
+    lastAnswer: '',
     written: [],
     pendingAudit: [],
     pressure: 0,
@@ -844,6 +847,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * 三件事同时机（都在 turn 结束后）、都不阻塞、共享同一份上下文——
    * 这正是"能合"的那一对（见 `01` §5.5：上行与下行不能合，但它们可以）。
    */
+  let pendingWrapup: Promise<void> | undefined
+
   async function runWrapup(answer: string): Promise<void> {
     const userSaid = state.lastUserText
     if (userSaid === '' && answer === '') return
@@ -869,14 +874,16 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     if (text === undefined) return
     const result = parseWrapup(text)
 
-    // 判用（比维护旁路每 N 轮一次更及时）
-    let used = 0
-    for (const index of result.used) {
-      const item = injected[index - 1]
-      if (item === undefined) continue
-      if (store.touch(item.id)) used += 1
+    // 沉淀：阶段一不写，所以这里是唯一写入入口，不会再产生同义副本
+    for (const fact of result.remembers) {
+      if (store.findSimilar(fact.text) !== undefined) continue
+      const entry = store.add(fact.text, {
+        origin: fact.origin,
+        salience: fact.origin === 'user' ? 0.8 : 0.6,
+        tagPath: fact.tagPath ?? '其他',
+      })
+      void judgeDoc(entry.id, entry.text)
     }
-    store.clearInjections(injected.map(item => item.id))
 
     // 预取：给下一轮排优先级，不注入
     const prefetchIds = result.prefetch
@@ -886,11 +893,11 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const nextTurn = Number(store.getMeta('turn_total') ?? 0) + 1
     if (prefetchIds.length > 0) store.setPrefetch(nextTurn, prefetchIds)
 
-    if (used > 0 || prefetchIds.length > 0) {
+    if (result.remembers.length > 0 || prefetchIds.length > 0) {
       state.pendingAudit.push({
         type: 'custom',
         customType: 'as/wrapup',
-        data: { used, prefetched: prefetchIds.length, turn: nextTurn },
+        data: { phase: 'write', remembered: result.remembers.length, prefetched: prefetchIds.length, turn: nextTurn },
       })
     }
   }
@@ -908,11 +915,18 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const answer = Array.isArray(message?.content)
       ? message.content.map(block => String((block as { text?: string }).text ?? '')).join('')
       : ''
-    // 不阻塞：收尾失败只是这一轮不沉淀、不预取，不补写、不猜测（§5.1）
-    void runWrapup(answer)
+    // 下一次的阶段一要用它判用；它必须是定稿的那一版
+    state.lastAnswer = answer
+    // 不阻塞：收尾失败只是这一轮不沉淀、不预取，不补写、不猜测（§5.1）。
+    // 但要留个句柄：进程退出前得等它跑完，否则 pi -p 会在写库前就退出。
+    pendingWrapup = runWrapup(answer).catch(() => undefined)
   })
 
-  pi.on('agent_settled', async () => {
+  // 关闭放在 session_shutdown：agent_settled 时收尾调用可能还在异步跑，
+  // 那时关库会撞 'database is not open'（已踩）。
+  pi.on('session_shutdown', async () => {
+    // 先等收尾落完账再关库（踩过：关早了报 database is not open）
+    if (pendingWrapup !== undefined) await pendingWrapup
     store.close()
   })
 
@@ -1036,6 +1050,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     current: Slot[],
   ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown }> {
     const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
+    // 判用对象：**上一轮**注入的条目（它们的回答已经在上下文里，判得准）
+    const injected = store.pendingInjections(10)
     const candidates: import('./realtime').Candidate[] = current.map(slot => ({
       index: slot.index,
       id: slot.entry.id,
@@ -1047,6 +1063,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const transcript = [
       '【本轮思考】',
       cueText.slice(0, 800),
+      '',
+      '【上一次的回答（判用要看它）】',
+      (state.lastAnswer ?? '').slice(0, 800) || '（无）',
+      '',
+      '【上轮注入（判用编号只在这份清单里有效）】',
+      injected.length > 0 ? injected.map((item, index) => `#${index + 1} ${item.text}`).join('\n') : '（无）',
       '',
       '【候选记忆】',
       candidates.length > 0 ? renderCandidates(candidates) : '（无）',
@@ -1074,19 +1096,18 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       }
     }
 
-    const { drops, rewrites, remembers } = parseRealtime(text)
-    let remembered = 0
-    for (const fact of remembers) {
-      if (store.findSimilar(fact.text) !== undefined) continue
-      const origin = fact.origin ?? 'model'
-      const written = store.add(fact.text, {
-        origin,
-        salience: origin === 'user' ? 0.8 : 0.6,
-        tagPath: fact.tagPath,
-      })
-      void judgeDoc(written.id, written.text)
-      remembered += 1
+    const { drops, rewrites, usages } = parseRealtime(text)
+    // 阶段一只读：即使模型误输出 REMEMBER，也不在这里写（写入归阶段二）
+    const remembered = 0
+
+    // 判用：阶段一顺手完成，处理完才允许进入阶段二（沉淀）
+    let used = 0
+    for (const index of usages) {
+      const item = injected[index - 1]
+      if (item === undefined) continue
+      if (store.touch(item.id)) used += 1
     }
+    store.clearInjections(injected.map(item => item.id))
 
     const dropSet = new Set(drops)
     const droppedIds = current.filter(slot => dropSet.has(slot.index)).map(slot => slot.entry.id)
@@ -1101,7 +1122,14 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       audit: {
         type: 'custom',
         customType: 'as/realtime',
-        data: { ok: true, candidates: current.length, dropped: drops.length, rewritten: rewrites.size, remembered },
+        data: {
+          ok: true,
+          phase: 'read',
+          candidates: current.length,
+          dropped: drops.length,
+          rewritten: rewrites.size,
+          used,
+        },
       },
     }
   }
