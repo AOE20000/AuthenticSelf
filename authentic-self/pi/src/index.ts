@@ -26,7 +26,7 @@ import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
 import { l0Digest, renderAnchors } from './anchors'
 import { INTENT_RULES, parseIntent } from './intent'
-import { renderArchiveView } from './archive'
+import { readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
 import {
   applyCompression,
@@ -349,10 +349,82 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
   trace('after:registerTool')
 
+  /** 当前会话文件——备注挂在它上面。 */
+  function sessionFileOf(ctx: unknown): string {
+    const manager = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } }).sessionManager
+    return manager?.getSessionFile?.() ?? ''
+  }
+
   pi.registerCommand('as-archive', {
-    description: '按时间分阶段检索归档（所有 → 年 → 月 → 日）',
+    description: '按时间分阶段检索归档；非日期参数按备注检索',
     handler: async (args: string, ctx: unknown) => {
-      notify(ctx, renderArchiveView(store.archiveRefs(), args ?? ''), 'info')
+      const key = (args ?? '').trim()
+      const refs = store.archiveRefs()
+      // 非日期参数 = 备注检索（与时间检索并列的另一个入口）
+      if (key !== '' && !/^\d{4}(-\d{2}){0,2}$/u.test(key)) {
+        const counts = new Map<string, number>()
+        for (const ref of refs) counts.set(ref.sessionFile, (counts.get(ref.sessionFile) ?? 0) + 1)
+        notify(ctx, renderNoteSearch(store.listNotes(), key, counts), 'info')
+        return
+      }
+      notify(ctx, renderArchiveView(refs, key), 'info')
+    },
+  })
+
+  pi.registerCommand('as-note', {
+    description: '给当前会话加备注（不带参数则列出本会话的备注）',
+    handler: async (args: string, ctx: unknown) => {
+      const sessionFile = sessionFileOf(ctx)
+      const text = (args ?? '').trim()
+      if (text === '') {
+        const mine = store.listNotes().filter(note => note.sessionFile === sessionFile)
+        notify(ctx, mine.length === 0 ? '本会话还没有备注。' : mine.map(note => `- ${note.text}`).join('\n'), 'info')
+        return
+      }
+      const id = store.addNote(sessionFile, text)
+      notify(ctx, id === undefined ? '备注没写进去（文本为空或拿不到会话文件）。' : '备注已挂在当前会话上。', 'info')
+    },
+  })
+
+  pi.registerTool({
+    name: 'archive',
+    label: 'archive',
+    description:
+      '查看被移出上下文的归档。必须逐级下钻：不给 key 看年份，给 2026 看月份，'
+      + '给 2026-10 看日期，给 2026-10-26 看条目；再加 read 序号取回原文片段。',
+    parameters: Type.Object({
+      key: Type.Optional(Type.String({ description: '时间粒度：2026 / 2026-10 / 2026-10-26' })),
+      read: Type.Optional(Type.Number({ description: '取第几条原文，只在给到日期时可用' })),
+    }),
+    async execute(_toolCallId: string, params: { key?: string; read?: number }) {
+      const key = (params.key ?? '').trim()
+      const refs = store.archiveRefs()
+      if (params.read !== undefined) {
+        // 强制分阶段：不给日期不给原文，避免一次性展开
+        if (!/^\d{4}-\d{2}-\d{2}$/u.test(key)) {
+          return {
+            content: [{ type: 'text' as const, text: '取原文需要先下钻到具体日期（如 2026-10-26），并给出条目序号。' }],
+            details: {},
+          }
+        }
+        const sameDay = refs.filter(ref => {
+          const date = new Date(ref.turnTs)
+          const pad = (value: number): string => String(value).padStart(2, '0')
+          return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` === key
+        })
+        const target = sameDay[params.read - 1]
+        if (target === undefined) {
+          return {
+            content: [{ type: 'text' as const, text: `${key} 没有第 ${params.read} 条。先不带 read 看清单。` }],
+            details: {},
+          }
+        }
+        const excerpt = await readExcerpt(target.sessionFile, target.turnTs, 600)
+        const head = `原文（${target.title}，${target.chars} 字）：`
+        return { content: [{ type: 'text' as const, text: `${head}
+${excerpt}` }], details: {} }
+      }
+      return { content: [{ type: 'text' as const, text: renderArchiveView(refs, key) }], details: {} }
     },
   })
 

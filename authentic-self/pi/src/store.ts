@@ -131,6 +131,15 @@ CREATE TABLE IF NOT EXISTS archive_pointer (
 );
 
 CREATE INDEX IF NOT EXISTS idx_archive_ts ON archive_pointer (turn_ts);
+
+-- 用户备注：**挂在会话上**，不是挂在某条对话上；由人写，不注入上下文。
+-- 它是检索入口（"我给它写过什么"），与分阶段时间检索并列。
+CREATE TABLE IF NOT EXISTS note (
+  id           TEXT PRIMARY KEY,
+  session_file TEXT NOT NULL,
+  text         TEXT NOT NULL,
+  created      INTEGER NOT NULL
+);
 `
 
 export interface MemoryEntry {
@@ -673,6 +682,38 @@ export class Store {
   }
 
   /**
+   * 给**一个会话**加一条备注。备注由人写，不注入上下文。
+   * @param sessionFile - 会话文件路径（备注的挂载点）。
+   * @param text - 人话注脚。
+   * @returns 备注 id；文本为空时为 undefined。
+   */
+  addNote(sessionFile: string, text: string): string | undefined {
+    const body = text.trim()
+    if (body === '' || sessionFile === '') return undefined
+    this.counter += 1
+    const id = `n-${Date.now().toString(36)}-${this.counter}`
+    this.db.prepare('INSERT INTO note (id, session_file, text, created) VALUES (?, ?, ?, ?)').run(id, sessionFile, body, Date.now())
+    return id
+  }
+
+  /**
+   * 读备注。给关键词就按备注正文过滤——**只匹配备注，不匹配对话正文**。
+   * @param keyword - 关键词；省略则全部。
+   */
+  listNotes(keyword?: string): { id: string; sessionFile: string; text: string; created: number }[] {
+    const rows = keyword === undefined || keyword.trim() === ''
+      ? this.db.prepare('SELECT id, session_file, text, created FROM note ORDER BY created DESC').all()
+      : this.db.prepare('SELECT id, session_file, text, created FROM note WHERE text LIKE ? ORDER BY created DESC')
+        .all(`%${keyword.trim()}%`)
+    return (rows as unknown as { id: string; session_file: string; text: string; created: number }[]).map(row => ({
+      id: row.id,
+      sessionFile: row.session_file,
+      text: row.text,
+      created: Number(row.created),
+    }))
+  }
+
+  /**
    * 记一批归档指针（压缩时调用）。同一轮重复记会被忽略。
    * @param refs - 被移出的轮。
    * @param sessionFile - 原文所在的会话文件。
@@ -703,8 +744,7 @@ export class Store {
   }
 
   /** 写一个小值。 */
-  setMeta(key: string, value: string): void {
-    this.db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, value)
+  setMeta(key: string, value: string): void {    this.db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, value)
   }
 
   /** 读取全部标记：锚点时间戳 → 原因。 */
