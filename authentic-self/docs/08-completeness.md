@@ -1,5 +1,7 @@
 # 完成度核对（2026-10-26）
 
+> 术语：文中"记忆旁路"即早期的"实时旁路 + 后台旁路"（两相：浮现相 / 沉淀相），2026-10-27 起统一。
+
 > 判据：**只认代码与实测证据**，不认文档自述。
 > ✅ = 代码在、且跑通过；🟡 = 部分实现或只在其一场景成立；⬜ = 没有。
 > 依据文档：`01-architecture`（记忆模型与决策）、`02-isolation`（边界）、`03-forgetting`（五区与操作集）、`04-implementation`（实现与实测）、`05-platform`（平台与扩展）、`07-roadmap`（M0–M5）。
@@ -24,7 +26,7 @@
 | A12 | 按轮压缩（判重 + 保护 + 末轮不动） | ✅ | `turns.ts` + 实测 `3/5`、`5/5` |
 | A13 | turn 内折叠工具结果 | ✅ | `context` 视图级，存档无痕 |
 | A14 | 维护旁路（打标/补记/关系/标签整理） | ✅ | `maintain.ts`；节拍持久化于 `meta.maint_last` |
-| A15 | 实时旁路（注入决策 + 冲突合并 + 写入） | ✅ | `realtime.ts`；`DROP/REWRITE/REMEMBER` 实测 |
+| A15 | 记忆旁路（注入决策 + 冲突合并 + 写入） | ✅ | `realtime.ts`；`DROP/REWRITE/REMEMBER` 实测 |
 | A16 | 标签树（根保护、逐层创建、≤7 字） | ✅ | `ensureTag`；单测 17 项 |
 | A17 | 主 AI 自判写入 / `memory` 单一工具 | ✅ | 五类齐：FORGET（软抑制）/ REVISE（supersede）/ REMIND / LINK（双向显式边 + 预算）/ UNLINK（显式删、隐式降权）；另有 `change` 申请通道 |
 | A18 | 交涉通道（自然语言 → 旁路解析） | ✅ | 实测 `intent: forget` → 条目转 `suppressed`（正文仍在库）；下一轮不再注入 |

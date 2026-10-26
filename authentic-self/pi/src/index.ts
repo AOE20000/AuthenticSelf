@@ -31,7 +31,7 @@ import { DIGEST_RULES, DOC_RULES, parseDigest, parseDocVerdict } from './digest'
 import { WRAPUP_RULES, parseWrapup } from './wrapup'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
-import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
+import { parseMemoryBypass, MEMORY_RULES, renderCandidates } from './memory'
 import {
   applyCompression,
   parseBatch,
@@ -1045,14 +1045,14 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * @param current - 当前候选槽。
    * @returns 过滤后的槽 + 一条审计；旁路没给出任何决策时为 undefined。
    */
-  async function runRealtime(
+  async function runMemoryBypass(
     cueText: string,
     current: Slot[],
   ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown }> {
     const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
     // 判用对象：**上一轮**注入的条目（它们的回答已经在上下文里，判得准）
     const injected = store.pendingInjections(10)
-    const candidates: import('./realtime').Candidate[] = current.map(slot => ({
+    const candidates: import('./memory').Candidate[] = current.map(slot => ({
       index: slot.index,
       id: slot.entry.id,
       text: slot.text,
@@ -1081,7 +1081,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     ].join('\n')
 
     const budget = AbortSignal.timeout(Number(process.env.AS_REALTIME_TIMEOUT ?? 12000))
-    const text = await summarize(transcript, REALTIME_RULES, budget)
+    const text = await summarize(transcript, MEMORY_RULES, budget)
     if (text === undefined) {
       // **直注已移除**：旁路不可用 = 本轮无注入。宁可哑火，不可错注。
       // 本轮漏掉的 REMEMBER 由维护旁路追补（延迟写入，不丢）。
@@ -1096,7 +1096,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       }
     }
 
-    const { drops, rewrites, usages } = parseRealtime(text)
+    const { drops, rewrites, usages } = parseMemoryBypass(text)
     // 阶段一只读：即使模型误输出 REMEMBER，也不在这里写（写入归阶段二）
     const remembered = 0
 
@@ -1115,7 +1115,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       .filter(slot => !dropSet.has(slot.index))
       .map(slot => ({ ...slot, text: rewrites.get(slot.index) ?? slot.text }))
 
-    if (debug) process.stderr.write(`[as] realtime: drop ${drops.length}, rewrite ${rewrites.size}, remember ${remembered}\n`)
+    if (debug) process.stderr.write(`[as] memory: drop ${drops.length}, rewrite ${rewrites.size}, remember ${remembered}\n`)
     return {
       slots,
       droppedIds,
@@ -1194,8 +1194,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const picked = [...prefetched, ...recalled.filter(entry => !seen.has(entry.id))]
     let slots: Slot[] = picked.map((entry, index) => ({ entry, index: index + 1, text: entry.text }))
 
-    if (canInject && realtimeOn) {
-      const result = await runRealtime(cue.text, slots)
+    if (canInject && realtimeOn) {  // 开关沿用 AS_REALTIME，语义=阶段一开关
+      const result = await runMemoryBypass(cue.text, slots)
       slots = result.slots
       // 被 DROP 的条目在本句内不得再回来（否则下一轮召回又会捞起来）
       for (const id of result.droppedIds) state.dropped.add(id)

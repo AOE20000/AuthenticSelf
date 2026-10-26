@@ -1,40 +1,21 @@
 /**
- * 实时旁路：每次回合结束时的一次调用，统一三件事。
+ * **记忆旁路**（原"实时旁路"）：记忆在上下文与库之间进出的那条通道（`01` §5.5）。
  *
- * 旧设计有三条重叠的路径（短记忆直注 / 长记忆触发旁路筛注 / 旁路提取写入），
- * 现在合成**一次调用**：
+ * 阶段制，两个强制顺序的相：
  *
- *   思考结束 → 取候选（短+长，含已注入标记）→ 实时旁路 → 注入决策 + 冲突合并 + 写入
+ *   浮现相（阶段一，settle，阻塞）
+ *     DROP / REWRITE / 判用上一轮注入 —— 只读不写
+ *   沉淀相（阶段二，turn 末，异步）
+ *     REMEMBER 沉淀 / PREFETCH 预取 —— 唯一写入入口
  *
- * 它拿到的材料：本轮思考、候选记忆（带叶路径与日期）、本句已注入清单、标签树。
- * 它输出的也是行式契约：DROP / REWRITE / REMEMBER，全部可省略。
+ * 阶段二开放的前提是阶段一标记完成（由代码保证）。同一时刻只有一条写入路径，
+ * 所以不会出现两处各写一遍的同义副本（踩过：13 条）。
  *
- * 冲突在这里合并：同叶两条互斥（住上海 vs 搬到北京）→ 看时间 →
- * REWRITE 成「此前住上海，现居北京」这类合并句，再 DROP 掉旧的。
- * 叶=槽，槽内本就该只有一条现值。
+ * 材料与输出都是行式契约，全部可省略；解析器对旧输出（REMEMBER 出现在阶段一）保持兼容，
+ * 但契约上阶段一不再提供写入。
  */
 
-/** 实时旁路的决策结果。 */
-export interface RealtimeResult {
-  /** 不注入的候选编号。 */
-  drops: number[]
-  /** 重写后注入：编号 → 新文本。 */
-  rewrites: Map<number, string>
-  /** 要写入的事实（阶段二已接管，这里保留以兼容旧输出）。 */
-  remembers: { tagPath?: string; text: string; origin?: 'user' | 'model' }[]
-  /** 上一轮注入里被真正用到的编号（指向"上轮注入"清单）。 */
-  usages: number[]
-}
-
-/**
- * 实时旁路的提示词。
- *
- * 纪律：
- * - 注入宁缺毋滥——无关记忆进上下文是噪声，还会挤占真记忆的位置
- * - 冲突合并看时间，写「此前…现…」，不要丢掉历史
- * - 只写长期有用的事实，路径优先复用现有标签
- */
-export const REALTIME_RULES = [
+export const MEMORY_RULES = [
   '你在决定「主 AI 这一轮该想起什么、该记住什么」。你会看到：本轮思考、候选记忆（带叶路径与日期）、本句已注入的清单、标签树。',
   '',
   '输出格式（每行一条；全部可省略——没有要改的就什么都不输出）：',
@@ -102,10 +83,10 @@ export function renderCandidates(items: readonly Candidate[]): string {
 }
 
 /** 解析实时旁路输出；坏行直接丢。 */
-export function parseRealtime(output: string): RealtimeResult {
+export function parseMemoryBypass(output: string): MemoryBypassResult {
   const drops: number[] = []
   const rewrites = new Map<number, string>()
-  const remembers: RealtimeResult['remembers'] = []
+  const remembers: MemoryBypassResult['remembers'] = []
   const usages: number[] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
