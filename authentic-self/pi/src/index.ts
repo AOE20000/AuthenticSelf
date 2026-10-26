@@ -22,6 +22,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
+import { l0Digest, renderAnchors } from './anchors'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
 import {
   applyCompression,
@@ -62,8 +63,23 @@ interface State {
   userTurns: number
   /** 攒到下一次 settle 时执行维护。 */
   pendingMaintenance: boolean
+  /** 锚点块是否已在本会话注入过（只注一次，不每轮刷）。 */
+  anchorsSent: boolean
   /** 最近一条 assistant 产出的线索文本。 */
   cue?: { text: string; kind: 'reasoning' | 'fallback' }
+}
+
+/** 锚点块的开头，用来判断这个会话是不是已经注入过。 */
+const ANCHOR_MARK = '以下是本系统的核心锚点'
+
+/**
+ * 上下文里是否已有锚点块。
+ *
+ * 不用内存标记：每次 `pi` 调用都是新进程，标记活不过一次会话。
+ * @param messages - 当前发给模型的消息。
+ */
+function hasAnchorBlock(messages: readonly unknown[]): boolean {
+  return messages.some(message => plainText(message).startsWith(ANCHOR_MARK))
 }
 
 /** 取消息里的纯文本（用户发言用）。 */
@@ -191,6 +207,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     lastViewAt: 0,
     userTurns: 0,
     pendingMaintenance: false,
+    anchorsSent: false,
   }
 
   /** 库为空时播种。仅用于测试，正式形态应由下行旁路写入。 */
@@ -495,11 +512,15 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const tagPaths = store.tagStats().map(stat => `${stat.path}(${stat.count})`)
     // 下行反馈：最近被注入过的记忆，判有没有真的被用上（用到才涨权重）
     const injected = store.pendingInjections(10)
+    const anchors = store.listAnchors('L1')
     const transcript = [
       renderBatch(messages, window),
       '',
       '记忆清单（可引用编号）：',
       listed.length > 0 ? renderMemoryList(listed) : '（空）',
+      '',
+      '身份锚点（L1）——描述它们的轮次必须 MARK，不能漏：',
+      anchors.length > 0 ? anchors.map(anchor => `- ${anchor.text}`).join('\n') : '（无）',
       '',
       '最近注入的记忆（判有没有被用上，编号只在这里有效）：',
       injected.length > 0
@@ -688,8 +709,27 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       state.written = []
     }
 
-    // 维护旁路：到点就跑一次（跑完才继续，因为它的结果影响同一轮的压缩判据）
     const contextMessages = (event.context as { contextMessages?: unknown[] } | undefined)?.contextMessages ?? []
+
+    // 锚点块：**会话内只注一次**。它是常量背景，不是检索结果，所以不走记忆通道。
+    // 判"注过没有"必须看上下文本身——内存标记活不过一次进程（每次 pi 调用都是新进程）。
+    if (!state.anchorsSent && !hasAnchorBlock(contextMessages)) {
+      state.anchorsSent = true
+      const anchors = store.listAnchors()
+      audit.push({
+        type: 'custom',
+        customType: 'as/anchor_view',
+        data: { l0: l0Digest(), l1: anchors.length, l1Ids: anchors.map(anchor => anchor.id) },
+      })
+      audit.push({
+        type: 'custom_message',
+        customType: 'as/anchor',
+        content: renderAnchors(anchors),
+        display: false,
+      })
+    }
+
+    // 维护旁路：到点就跑一次（跑完才继续，因为它的结果影响同一轮的压缩判据）
     if (state.pendingMaintenance || maintenanceDue(contextMessages)) {
       state.pendingMaintenance = false
       store.setMeta('maint_last', String(segmentTurns(contextMessages, { keepRecent: 0 }).length))

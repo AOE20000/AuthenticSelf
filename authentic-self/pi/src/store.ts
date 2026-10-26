@@ -108,6 +108,16 @@ CREATE TABLE IF NOT EXISTS injection_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_injection_entry ON injection_log (entry_id);
+
+-- L1/L2 锚点：append-only，版本化。**L0 不在这里**——它编译进代码。
+CREATE TABLE IF NOT EXISTS anchor (
+  id       TEXT PRIMARY KEY,
+  level    TEXT NOT NULL,
+  text     TEXT NOT NULL,
+  origin   TEXT NOT NULL,
+  reason   TEXT NOT NULL DEFAULT '',
+  created  INTEGER NOT NULL
+);
 `
 
 export interface MemoryEntry {
@@ -560,8 +570,7 @@ export class Store {
   /**
    * 记一条注入。**只记账，不动权重**——注入本身绝不提升显著性（硬边界）。
    * @param ids - 本次注入的条目 id。
-   */
-  logInjection(ids: readonly string[]): void {
+   */  logInjection(ids: readonly string[]): void {
     if (ids.length === 0) return
     const statement = this.db.prepare('INSERT INTO injection_log (entry_id, created) VALUES (?, ?)')
     const now = Date.now()
@@ -609,6 +618,45 @@ export class Store {
     if (ids.length === 0) return
     const placeholders = ids.map(() => '?').join(',')
     this.db.prepare(`DELETE FROM injection_log WHERE entry_id IN (${placeholders})`).run(...ids)
+  }
+
+  /**
+   * 写一条锚点（L1/L2）。**模型不可写**——这是硬不变量，写在代码里。
+   *
+   * 两条拒绝：level 为 L0（L0 编译进代码，不进存储）、origin 为 model（模型不得改身份）。
+   * @param text - 锚点正文。
+   * @param options.level - L1（身份叙事）或 L2（风格特质）。
+   * @param options.origin - 来源；`human` / `maintenance` 之外一律拒绝。
+   * @param options.reason - 为什么要立这条锚点（审计用）。
+   * @returns 新锚点 id；被拒绝时为 undefined。
+   */
+  addAnchor(
+    text: string,
+    options: { level?: 'L1' | 'L2'; origin: string; reason?: string } = { origin: 'human' },
+  ): string | undefined {
+    const level = options.level ?? 'L1'
+    if (level === 'L0') return undefined
+    // 硬不变量：模型不得改身份；外部输入与导入内容更不得直接写锚点
+    if (options.origin !== 'human' && options.origin !== 'maintenance') return undefined
+    if (text.trim() === '') return undefined
+    this.counter += 1
+    const id = `a-${Date.now().toString(36)}-${this.counter}`
+    this.db
+      .prepare('INSERT INTO anchor (id, level, text, origin, reason, created) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, level, text.trim(), options.origin, options.reason ?? '', Date.now())
+    return id
+  }
+
+  /**
+   * 读锚点，按创建顺序（append-only，新的在后）。
+   * @param level - 只取某一层；省略则全部。
+   */
+  listAnchors(level?: string): { id: string; level: string; text: string; created: number }[] {
+    const base = 'SELECT id, level, text, created FROM anchor'
+    const rows = level === undefined
+      ? this.db.prepare(`${base} ORDER BY created`).all()
+      : this.db.prepare(`${base} WHERE level = ? ORDER BY created`).all(level)
+    return rows as unknown as { id: string; level: string; text: string; created: number }[]
   }
 
   /** 写一个小值。 */
