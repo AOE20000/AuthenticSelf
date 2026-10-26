@@ -27,6 +27,7 @@ import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } 
 import { l0Digest, renderAnchors } from './anchors'
 import { CHANGE_RULES, INTENT_RULES, parseChange, parseIntent } from './intent'
 import { APPROVER_PROMPT, buildApproverInput, parseVerdict } from './approve'
+import { DIGEST_RULES, parseDigest } from './digest'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
@@ -179,6 +180,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const realtimeOn = process.env.AS_REALTIME !== '0'
   // 联想带的预算：`link` 禁止无预算扩散（01 §6.3），一次最多带出这么多条
   const linkBudget = Number(process.env.AS_LINK_BUDGET ?? 2)
+  // 长条目注入的硬上限：选 full 却超过它，只能降级为节选（§5.2）
+  const longBudget = Number(process.env.AS_LONG_BUDGET ?? 1200)
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -1090,7 +1093,64 @@ export default function authenticSelf(pi: ExtensionAPI): void {
         linkedExtra.push(extra)
       }
     }
-    const finalPicked = [...basePicked, ...linkedExtra.slice(0, linkBudget)]
+    let finalPicked = [...basePicked, ...linkedExtra.slice(0, linkBudget)]
+
+    // 长条目裁决（D10 / §4.1）：long 不得直接塞，交旁路在 full/excerpt/summary/skip 里挑
+    const longOnes = finalPicked.filter(entry => entry.span === 'long')
+    if (longOnes.length > 0) {
+      const listed = longOnes
+        .map((entry, at) => `#${at + 1}「${entry.text.slice(0, 800)}」${entry.text.length > 800 ? '…' : ''}`)
+        .join('\n\n')
+      const budget = AbortSignal.timeout(Number(process.env.AS_DIGEST_TIMEOUT ?? 15000))
+      const decided = await summarize(
+        [`【本轮线索】${cue.text.slice(0, 400)}`, '', '【待裁决的长记忆】', listed].join('\n'),
+        DIGEST_RULES,
+        budget,
+      )
+      const decisions = decided === undefined ? [] : parseDigest(decided)
+      const byId = new Map<string, { entry: typeof longOnes[number]; mode: 'full' | 'excerpt' | 'summary'; text: string }>()
+      longOnes.forEach((entry, at) => {
+        const decision = decisions.find(item => item.index === at + 1)
+        const fallback = `${entry.text.slice(0, 240)}…`
+        const mode = decision?.mode === 'skip'
+          ? 'skip'
+          : decision?.mode === 'summary'
+            ? 'summary'
+            : decision?.mode === 'full'
+              ? 'full'
+              : 'excerpt'
+        const text = decision?.text ?? (mode === 'full' ? entry.text : fallback)
+        if (mode !== 'skip') byId.set(entry.id, { entry, mode, text })
+      })
+
+      finalPicked = finalPicked.flatMap(entry => {
+        if (entry.span !== 'long') return [entry]
+        const verdict = byId.get(entry.id)
+        if (verdict === undefined) return []
+        // 预算：选了 full 但仍超长 → 降级为节选，理由进审计
+        const overBudget = verdict.mode === 'full' && verdict.text.length > longBudget
+        return [{
+          ...entry,
+          text: overBudget ? `${verdict.text.slice(0, longBudget)}…` : verdict.text,
+          mode: overBudget ? 'excerpt' as const : verdict.mode,
+          degraded: overBudget || verdict.mode !== 'full',
+        }]
+      })
+
+      audit.push({
+        type: 'custom',
+        customType: 'as/long_digest',
+        data: {
+          judged: longOnes.length,
+          full: finalPicked.filter(entry => entry.span === 'long' && entry.mode === 'full').length,
+          excerpt: finalPicked.filter(entry => entry.span === 'long' && entry.mode === 'excerpt').length,
+          summary: finalPicked.filter(entry => entry.span === 'long' && entry.mode === 'summary').length,
+          skipped: longOnes.length - finalPicked.filter(entry => entry.span === 'long').length,
+          // 选 full 却答不出"为什么不写成文档" → 建议转存（§4.1）
+          recommendDoc: decisions.filter(item => item.mode === 'full' && (item.whynot ?? '') === '').length,
+        },
+      })
+    }
 
     if (finalPicked.length === 0) {
       return audit.length > 0 ? { entries: audit as never[] } : undefined
@@ -1114,8 +1174,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
             ids: finalPicked.map(entry => entry.id),
             cue: cue.kind,
             outcome: event.outcome,
-            // 长条目没做旁路裁决，统一降级为节选——把降级记进审计
-            degraded: finalPicked.filter(entry => entry.span === 'long' && entry.text.length > 240).map(entry => entry.id),
+            // 被裁决降级（或超预算降级）的条目，逐条记进审计
+            degraded: finalPicked.filter(entry => entry.span === 'long' && entry.mode !== 'full').map(entry => entry.id),
           },
         },
         // 真正递给模型的注入

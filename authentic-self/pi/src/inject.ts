@@ -16,11 +16,14 @@
 
 /** 单条注入项。 */
 export interface InjectItem {
+  /** 已按裁决处理过的文本（full 用原文，excerpt/summary 用旁路给的替代文本）。 */
   text: string
   origin: string
   confidence: number
   tStart: number
   span?: string
+  /** 裁决结果：决定行首标记。省略时按 span 推断（long 且有替代文本 → 节选）。 */
+  mode?: 'full' | 'excerpt' | 'summary'
 }
 
 /** 超过这个长度就截断（节选）。 */
@@ -40,9 +43,11 @@ export function dateLabel(ms: number): string {
  */
 export function render(entries: readonly InjectItem[], round: number): string {
   const lines = entries.map(entry => {
-    const isExcerpt = entry.span === 'long' && entry.text.length > EXCERPT_CHARS
-    const text = isExcerpt ? `${entry.text.slice(0, EXCERPT_CHARS)}…` : entry.text
-    const mark = isExcerpt ? '记忆·节选' : '记忆'
+    const mode = entry.mode ?? (entry.span === 'long' && entry.text.length > EXCERPT_CHARS ? 'excerpt' : 'full')
+    const text = mode === 'full' || entry.text.length <= EXCERPT_CHARS
+      ? entry.text
+      : `${entry.text.slice(0, EXCERPT_CHARS)}…`
+    const mark = mode === 'summary' ? '记忆·摘要' : mode === 'excerpt' ? '记忆·节选' : '记忆'
     const trust = entry.confidence >= 0.7 ? '高' : '低'
     return `[${mark}｜${dateLabel(entry.tStart)}｜来源:${entry.origin}｜置信:${trust}] ${text}`
   })
