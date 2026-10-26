@@ -111,12 +111,13 @@ CREATE INDEX IF NOT EXISTS idx_injection_entry ON injection_log (entry_id);
 
 -- L1/L2 锚点：append-only，版本化。**L0 不在这里**——它编译进代码。
 CREATE TABLE IF NOT EXISTS anchor (
-  id       TEXT PRIMARY KEY,
-  level    TEXT NOT NULL,
-  text     TEXT NOT NULL,
-  origin   TEXT NOT NULL,
-  reason   TEXT NOT NULL DEFAULT '',
-  created  INTEGER NOT NULL
+  id          TEXT PRIMARY KEY,
+  level       TEXT NOT NULL,
+  text        TEXT NOT NULL,
+  origin      TEXT NOT NULL,
+  reason      TEXT NOT NULL DEFAULT '',
+  replaced_by TEXT,
+  created     INTEGER NOT NULL
 );
 
 -- 归档指针：哪一轮被移出上下文、原文在哪个会话文件里。
@@ -139,6 +140,19 @@ CREATE TABLE IF NOT EXISTS note (
   session_file TEXT NOT NULL,
   text         TEXT NOT NULL,
   created      INTEGER NOT NULL
+);
+
+-- 大改申请：模型只能提，**不能落**。落定必须有人批准（01 §7.1 / D2）。
+CREATE TABLE IF NOT EXISTS pending_change (
+  id        TEXT PRIMARY KEY,
+  kind      TEXT NOT NULL,
+  anchor_id TEXT NOT NULL,
+  old_text  TEXT NOT NULL,
+  new_text  TEXT NOT NULL,
+  reason    TEXT NOT NULL,
+  status    TEXT NOT NULL DEFAULT 'pending',
+  created   INTEGER NOT NULL,
+  decided   INTEGER
 );
 `
 
@@ -245,6 +259,10 @@ export class Store {
     }
     if (!columns.some(column => column.name === 'last_used')) {
       this.db.exec('ALTER TABLE memory_entry ADD COLUMN last_used INTEGER')
+    }
+    const anchorColumns = this.db.prepare('PRAGMA table_info(anchor)').all() as unknown as { name: string }[]
+    if (!anchorColumns.some(column => column.name === 'replaced_by')) {
+      this.db.exec('ALTER TABLE anchor ADD COLUMN replaced_by TEXT')
     }
     this.ensureTag(ROOT_TAG)
     this.file = file
@@ -673,11 +691,20 @@ export class Store {
    * 读锚点，按创建顺序（append-only，新的在后）。
    * @param level - 只取某一层；省略则全部。
    */
-  listAnchors(level?: string): { id: string; level: string; text: string; created: number }[] {
+  listAnchors(
+    level?: string,
+    options: { includeReplaced?: boolean } = {},
+  ): { id: string; level: string; text: string; created: number }[] {
     const base = 'SELECT id, level, text, created FROM anchor'
+    const live = options.includeReplaced === true ? '' : 'replaced_by IS NULL'
+    const where = [
+      live,
+      level === undefined ? '' : 'level = ?',
+    ].filter(clause => clause !== '').join(' AND ')
+    const sql = `${base}${where === '' ? '' : ` WHERE ${where}`} ORDER BY created`
     const rows = level === undefined
-      ? this.db.prepare(`${base} ORDER BY created`).all()
-      : this.db.prepare(`${base} WHERE level = ? ORDER BY created`).all(level)
+      ? this.db.prepare(sql).all()
+      : this.db.prepare(sql).all(level)
     return rows as unknown as { id: string; level: string; text: string; created: number }[]
   }
 
@@ -711,6 +738,128 @@ export class Store {
       text: row.text,
       created: Number(row.created),
     }))
+  }
+
+  /**
+   * 记一条大改申请。**模型只能提，不能落**——落定走 `decideChange`，由人触发。
+   * @param request - 申请内容。
+   * @returns 申请 id；参数不合法（无理由、超长）时为 undefined。
+   */
+  addChange(request: {
+    kind: string
+    anchorId: string
+    newText: string
+    reason: string
+  }): string | undefined {
+    const reason = request.reason.trim()
+    const newText = request.newText.trim()
+    // 理由先于结论：没有像样的理由，申请不受理
+    if (reason.length < 10) return undefined
+    // 幅度上限：一次只改一条锚点，且新文本不能长到变成另一段人生
+    if (newText === '' || newText.length > 120) return undefined
+    const anchor = this.db.prepare('SELECT text FROM anchor WHERE id = ?').get(request.anchorId) as unknown as
+      | { text: string }
+      | undefined
+    if (anchor === undefined) return undefined
+
+    this.counter += 1
+    const id = `c-${Date.now().toString(36)}-${this.counter}`
+    this.db
+      .prepare('INSERT INTO pending_change (id, kind, anchor_id, old_text, new_text, reason, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, request.kind, request.anchorId, anchor.text, newText, reason, 'pending', Date.now())
+    return id
+  }
+
+  /** 待批与已决的申请，新在前。 */
+  listChanges(status?: string): {
+    id: string
+    kind: string
+    anchorId: string
+    oldText: string
+    newText: string
+    reason: string
+    status: string
+    created: number
+  }[] {
+    const base = 'SELECT id, kind, anchor_id, old_text, new_text, reason, status, created FROM pending_change'
+    const rows = status === undefined
+      ? this.db.prepare(`${base} ORDER BY created DESC`).all()
+      : this.db.prepare(`${base} WHERE status = ? ORDER BY created DESC`).all(status)
+    return (rows as unknown as {
+      id: string
+      kind: string
+      anchor_id: string
+      old_text: string
+      new_text: string
+      reason: string
+      status: string
+      created: number
+    }[]).map(row => ({
+      id: row.id,
+      kind: row.kind,
+      anchorId: row.anchor_id,
+      oldText: row.old_text,
+      newText: row.new_text,
+      reason: row.reason,
+      status: row.status,
+      created: Number(row.created),
+    }))
+  }
+
+  /**
+   * 裁决一条申请。**只允许人做**——所以 origin 必须是 `human`。
+   *
+   * 批准 = 新锚点入账（append-only）+ 旧锚点标记被取代；撤销 = 状态改回。
+   * @param id - 申请 id。
+   * @param decision - approve / reject / revoke。
+   * @param origin - 谁做的决定。
+   */
+  decideChange(id: string, decision: 'approve' | 'reject' | 'revoke', origin = 'human'): boolean {
+    if (origin !== 'human') return false
+    const row = this.db.prepare('SELECT * FROM pending_change WHERE id = ?').get(id) as unknown as
+      | { anchor_id: string; old_text: string; new_text: string; status: string }
+      | undefined
+    if (row === undefined) return false
+
+    if (decision === 'approve') {
+      if (row.status !== 'pending') return false
+      const anchor = this.db.prepare('SELECT level FROM anchor WHERE id = ?').get(row.anchor_id) as unknown as
+        | { level: string }
+        | undefined
+      if (anchor === undefined) return false
+      // 旧锚点作废改成"被取代"：anchor 表是 append-only，用 replaced_by 指过去
+      this.counter += 1
+      const newId = `a-${Date.now().toString(36)}-${this.counter}`
+      this.db
+        .prepare('INSERT INTO anchor (id, level, text, origin, reason, created) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(newId, anchor.level, row.new_text, 'human', `change:${id}`, Date.now())
+      this.db.prepare('UPDATE anchor SET replaced_by = ? WHERE id = ?').run(newId, row.anchor_id)
+      this.db.prepare('UPDATE pending_change SET status = ?, decided = ? WHERE id = ?').run('approved', Date.now(), id)
+      this.addMeta('revocable_anchor', `${id}:${newId}`)
+      return true
+    }
+
+    if (decision === 'reject') {
+      if (row.status !== 'pending') return false
+      this.db.prepare('UPDATE pending_change SET status = ?, decided = ? WHERE id = ?').run('rejected', Date.now(), id)
+      return true
+    }
+
+    // revoke：只撤已批准的——把那次批准写进去的锚点作废，旧文本重新入账
+    if (row.status !== 'approved') return false
+    this.counter += 1
+    const rollbackId = `a-${Date.now().toString(36)}-r${this.counter}`
+    this.db
+      .prepare('INSERT INTO anchor (id, level, text, origin, reason, created) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(rollbackId, 'L1', row.old_text, 'human', `revoke:${id}`, Date.now())
+    this.db.prepare('UPDATE anchor SET replaced_by = ? WHERE reason = ?').run(rollbackId, `change:${id}`)
+    this.db.prepare('UPDATE pending_change SET status = ?, decided = ? WHERE id = ?').run('revoked', Date.now(), id)
+    return true
+  }
+
+  /** 追加一行 meta（多值场景用 `key:ts` 存）。 */
+  private addMeta(key: string, value: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(`${key}:${Date.now()}`, value)
   }
 
   /**

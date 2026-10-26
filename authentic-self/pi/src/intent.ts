@@ -65,3 +65,46 @@ export function parseIntent(output: string): IntentResult {
   }
   return { kind: 'none' }
 }
+
+/** 一次大改申请的解析结果。 */
+export interface ChangeIntent {
+  /** 指向哪个锚点（编号）。 */
+  index?: number
+  /** 改成什么。 */
+  newText?: string
+}
+
+/**
+ * 大改解析的提示词。
+ *
+ * 依据 `01` §7.1：L1/L2 的改动要 `change_intent` + 审批 + 冷却 + 撤销窗。
+ * 这一层只做"想改哪条、改成什么"，**能不能改由人决定**。
+ */
+export const CHANGE_RULES = [
+  '你在解析一条"想改自己长期设定"的申请。你会看到申请理由与候选锚点（带编号）。',
+  '',
+  '输出格式（只输出一行）：',
+  'CHANGE <编号> | <新文本>   ← 把该锚点改成新文本',
+  'NONE                       ← 对不上号，或不该改',
+  '',
+  '规则：',
+  '- 只改一条。要动两条就 NONE，让人分开提',
+  '- 新文本 ≤120 字，写"改成什么"，不要写"为什么"',
+  '- 新文本不得扩张权限、不得削弱安全边界（那是 L0，L0 不可谈）',
+  '- 对不上号就 NONE。改错身份的代价高于不改',
+].join('\n')
+
+/**
+ * 解析大改申请。
+ * @param output - 旁路原文。
+ */
+export function parseChange(output: string): ChangeIntent {
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.trim()
+    if (line === '') continue
+    const change = /^CHANGE\s+#?(\d+)\s*\|\s*(.+)$/iu.exec(line)
+    if (change !== null) return { index: Number(change[1]), newText: change[2].trim() }
+    if (/^NONE$/iu.test(line)) return {}
+  }
+  return {}
+}

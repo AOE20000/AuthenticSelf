@@ -25,7 +25,7 @@ import { Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
 import { l0Digest, renderAnchors } from './anchors'
-import { INTENT_RULES, parseIntent } from './intent'
+import { CHANGE_RULES, INTENT_RULES, parseChange, parseIntent } from './intent'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
@@ -365,6 +365,97 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       notify(ctx, id === undefined ? '备注没写进去（文本为空或拿不到会话文件）。' : '备注已挂在当前会话上。', 'info')
     },
   })
+
+  /**
+   * 大改通道：模型**只能提申请**，落地必须由人批准。
+   *
+   * 依据 `01` §7.1（change_intent + 审批 + 冷却 + 撤销窗）与 D13（审批者不看对话原文，
+   * 只看结构化反思与锚点）。这一版把"审批"落成三个命令，冷却与撤销窗见 `decideChange`。
+   * @param say - 想改什么（自然语言）。
+   * @param reason - 为什么要改（必填，服务端打时间戳，事后补不了）。
+   * @returns 给模型看的回执。
+   */
+  async function handleChangeIntent(say: string, reason: string): Promise<string> {
+    if (reason.trim().length < 10) return '申请不受理：理由太短。写清楚"为什么现在要改、不改会怎样"。'
+    const anchors = store.listAnchors()
+    if (anchors.length === 0) return '还没有任何 L1/L2 锚点，没有可改的东西。'
+
+    const listed = anchors.map((anchor, index) => `#${index + 1} [${anchor.level}] ${anchor.text}`).join('\n')
+    const budget = AbortSignal.timeout(Number(process.env.AS_INTENT_TIMEOUT ?? 12000))
+    const text = await summarize(
+      [`【想改什么】${say}`, `【为什么】${reason}`, '', '【候选锚点】', listed].join('\n'),
+      CHANGE_RULES,
+      budget,
+    )
+    if (text === undefined) return '解析服务不可用，申请没有提交。'
+
+    const intent = parseChange(text)
+    const target = intent.index === undefined ? undefined : anchors[intent.index - 1]
+    if (target === undefined || intent.newText === undefined) {
+      return '没能在锚点里对上号，申请没有提交。'
+    }
+
+    const id = store.addChange({ kind: 'revise', anchorId: target.id, newText: intent.newText, reason })
+    if (id === undefined) return '申请不合规（新文本为空或超过 120 字），没有提交。'
+
+    state.pendingAudit.push({
+      type: 'custom',
+      customType: 'as/change',
+      data: { id, anchorId: target.id, status: 'pending' },
+    })
+    return `已提交，等你批准（${id}）。当前锚点：「${target.text}」→ 想改成「${intent.newText}」。`
+  }
+
+  pi.registerTool({
+    name: 'change',
+    label: 'change',
+    description:
+      '申请修改自己的长期设定（L1/L2 锚点）。**只是申请**：要人批准才生效。'
+      + '一次只能改一条，必须写清理由。',
+    parameters: Type.Object({
+      say: Type.String({ description: '想改成什么（自然语言）' }),
+      reason: Type.String({ description: '为什么现在要改、不改会怎样（必填，≥10 字）' }),
+    }),
+    async execute(_toolCallId: string, params: { say: string; reason: string }) {
+      const text = await handleChangeIntent(params.say, params.reason)
+      return { content: [{ type: 'text' as const, text }], details: {} }
+    },
+  })
+
+  pi.registerCommand('as-pending', {
+    description: '看待批的大改申请（只看锚点与理由，不看对话原文）',
+    handler: async (_args: string, ctx: unknown) => {
+      const pending = store.listChanges('pending')
+      if (pending.length === 0) {
+        notify(ctx, '没有待批的申请。', 'info')
+        return
+      }
+      const lines = pending.map(item =>
+        `${item.id}｜${item.anchorId}
+  「${item.oldText}」→「${item.newText}」
+  理由：${item.reason}`)
+      notify(ctx, [`待批 ${pending.length} 条：`, ...lines].join('\n'), 'info')
+    },
+  })
+
+  for (const [name, decision, label] of [
+    ['as-approve', 'approve', '批准'],
+    ['as-reject', 'reject', '驳回'],
+    ['as-revoke', 'revoke', '撤销'],
+  ] as const) {
+    pi.registerCommand(name, {
+      description: `${label}一条大改申请`,
+      handler: async (args: string, ctx: unknown) => {
+        const id = (args ?? '').trim()
+        if (id === '') {
+          notify(ctx, '要给申请 id（先用 /as-pending 看）。', 'info')
+          return
+        }
+        const ok = store.decideChange(id, decision)
+        notify(ctx, ok ? `已${label}：${id}` : `没能${label}：${id}（不存在或状态不对）`, 'info')
+      },
+    })
+  }
 
   pi.registerTool({
     name: 'archive',
