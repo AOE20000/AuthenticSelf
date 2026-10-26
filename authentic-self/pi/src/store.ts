@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS pending_change (
   reflection TEXT NOT NULL DEFAULT '',
   normalized TEXT NOT NULL DEFAULT '',
   status     TEXT NOT NULL DEFAULT 'pending',
+  verdict_reason TEXT NOT NULL DEFAULT '',
   apply_at   INTEGER NOT NULL DEFAULT 0,
   created    INTEGER NOT NULL,
   decided    INTEGER
@@ -745,7 +746,8 @@ export class Store {
   }
 
   /**
-   * 记一条大改申请。**模型只能提，不能落**——落定走 `decideChange`，由人触发。
+   * 记一条大改申请。**模型只能提，不能落**——判定由审批旁路（approve.ts）给，
+   * 落库由代码执行。人保留否决与撤销（decideChange）。
    * @param request - 申请内容。
    * @returns 申请 id；参数不合法（无理由、超长）时为 undefined。
    */
@@ -754,13 +756,9 @@ export class Store {
     anchorId: string
     newText: string
     reason: string
-    /** 风险分级：routine 静默生效，major 进待批 + 冷却（`01` §7.5 / A7）。 */
     risk?: 'routine' | 'major'
-    /** 结构化反思（十条字段的机器可读版）。 */
     reflection?: Record<string, string>
-    /** 标准化映射：原话 → 标准命令，必须留档（`01` §7.5 推论 2）。 */
     normalized?: string
-    /** 冷却到什么时候（毫秒时间戳）；0 表示不冷却。 */
     applyAt?: number
   }): string | undefined {
     const reason = request.reason.trim()
@@ -797,7 +795,7 @@ export class Store {
     return id
   }
 
-  /** 待批与已决的申请，新在前。 */
+  /** 全部申请，新在前。 */
   listChanges(status?: string): {
     id: string
     kind: string
@@ -809,11 +807,12 @@ export class Store {
     reflection: Record<string, string>
     normalized: string
     status: string
+    verdictReason: string
     applyAt: number
     created: number
   }[] {
     const base = `SELECT id, kind, anchor_id, old_text, new_text, reason, risk, reflection, normalized,
-      status, apply_at, created FROM pending_change`
+      status, verdict_reason, apply_at, created FROM pending_change`
     const rows = status === undefined
       ? this.db.prepare(`${base} ORDER BY created DESC`).all()
       : this.db.prepare(`${base} WHERE status = ? ORDER BY created DESC`).all(status)
@@ -828,6 +827,7 @@ export class Store {
       reflection: string
       normalized: string
       status: string
+      verdict_reason: string
       apply_at: number
       created: number
     }[]).map(row => ({
@@ -847,67 +847,111 @@ export class Store {
       })(),
       normalized: row.normalized,
       status: row.status,
+      verdictReason: row.verdict_reason,
       applyAt: Number(row.apply_at),
       created: Number(row.created),
     }))
   }
 
   /**
-   * 裁决一条申请。
-   *
-   * 谁能批：
-   * - `human`：任何级别；
-   * - `maintenance`：**仅 routine**——那是代码按标准化结果执行（`01` §7.5 的"静默生效"），
-   *   模型本身仍不能直接改身份，所以 major 一律只认人。
-   *
-   * 冷却（`01` §7.4）：`apply_at` 未到时，批准被拒并告知还要等多久。
+   * 记下审批者的裁定。**只记，不落库**——落库走 applyChange。
+   * @param id - 申请 id。
+   * @param verdict - approve / reject / clarify。
+   * @param reason - 裁定理由（reject 必须能指出具体哪一条成立）。
+   * @param options - 风险等级与冷却到期时间。
+   */
+  judgeChange(
+    id: string,
+    verdict: 'approve' | 'reject' | 'clarify',
+    reason: string,
+    options: { risk?: 'routine' | 'major'; applyAt?: number } = {},
+  ): boolean {
+    const status = verdict === 'approve' ? 'approved' : verdict === 'reject' ? 'rejected' : 'clarify'
+    const result = this.db
+      .prepare(`UPDATE pending_change SET status = ?, verdict_reason = ?, risk = COALESCE(?, risk),
+        apply_at = ?, decided = ? WHERE id = ? AND status = 'pending'`)
+      .run(status, reason, options.risk ?? null, options.applyAt ?? 0, Date.now(), id)
+    return Number(result.changes) > 0
+  }
+
+  /** 冷却已到期、可以落库的申请。 */
+  dueChanges(now = Date.now()): { id: string; anchorId: string; newText: string; risk: string; normalized: string }[] {
+    const rows = this.db
+      .prepare(`SELECT id, anchor_id, new_text, risk, normalized FROM pending_change
+        WHERE status = 'approved' AND apply_at <= ? ORDER BY created`)
+      .all(now) as unknown as { id: string; anchor_id: string; new_text: string; risk: string; normalized: string }[]
+    return rows.map(row => ({
+      id: row.id,
+      anchorId: row.anchor_id,
+      newText: row.new_text,
+      risk: row.risk,
+      normalized: row.normalized,
+    }))
+  }
+
+  /**
+   * 把一条已批准的申请落库：新锚点入账（append-only），旧锚点标被取代。
+   * @param id - 申请 id。
+   * @returns 新锚点 id；失败为 undefined。
+   */
+  applyChange(id: string): string | undefined {
+    const row = this.db.prepare('SELECT * FROM pending_change WHERE id = ?').get(id) as unknown as
+      | { anchor_id: string; new_text: string; status: string }
+      | undefined
+    if (row === undefined || row.status !== 'approved') return undefined
+    const anchor = this.db.prepare('SELECT level FROM anchor WHERE id = ?').get(row.anchor_id) as unknown as
+      | { level: string }
+      | undefined
+    if (anchor === undefined) return undefined
+
+    this.counter += 1
+    const newId = `a-${Date.now().toString(36)}-${this.counter}`
+    this.db
+      .prepare('INSERT INTO anchor (id, level, text, origin, reason, created) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(newId, anchor.level, row.new_text, 'approver', `change:${id}`, Date.now())
+    this.db.prepare('UPDATE anchor SET replaced_by = ? WHERE id = ?').run(newId, row.anchor_id)
+    this.db.prepare('UPDATE pending_change SET status = ? WHERE id = ?').run('applied', id)
+    return newId
+  }
+
+  /**
+   * 人的裁决：批准 / 驳回 / 撤销。批准后立刻落库（人不需要等冷却）。
    * @param id - 申请 id。
    * @param decision - approve / reject / revoke。
-   * @param origin - 谁做的决定。
+   * @param origin - 只认 human。
    */
   decideChange(id: string, decision: 'approve' | 'reject' | 'revoke', origin = 'human'): boolean {
+    if (origin !== 'human') return false
     const row = this.db.prepare('SELECT * FROM pending_change WHERE id = ?').get(id) as unknown as
-      | { anchor_id: string; old_text: string; new_text: string; status: string; risk: string; apply_at: number }
+      | { anchor_id: string; old_text: string; status: string }
       | undefined
     if (row === undefined) return false
-    // routine 允许代码按标准化结果执行（静默生效）；major 只认人
-    if (origin !== 'human' && !(origin === 'maintenance' && row.risk === 'routine')) return false
 
     if (decision === 'approve') {
-      if (row.status !== 'pending') return false
-      // 冷却未到：不批，也不改状态，等它到期
-      if (Number(row.apply_at) > Date.now()) return false
-      const anchor = this.db.prepare('SELECT level FROM anchor WHERE id = ?').get(row.anchor_id) as unknown as
-        | { level: string }
-        | undefined
-      if (anchor === undefined) return false
-      // 旧锚点作废改成"被取代"：anchor 表是 append-only，用 replaced_by 指过去
-      this.counter += 1
-      const newId = `a-${Date.now().toString(36)}-${this.counter}`
+      if (row.status !== 'approved' && row.status !== 'pending') return false
       this.db
-        .prepare('INSERT INTO anchor (id, level, text, origin, reason, created) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(newId, anchor.level, row.new_text, origin, `change:${id}`, Date.now())
-      this.db.prepare('UPDATE anchor SET replaced_by = ? WHERE id = ?').run(newId, row.anchor_id)
-      this.db.prepare('UPDATE pending_change SET status = ?, decided = ? WHERE id = ?').run('approved', Date.now(), id)
-      this.addMeta('revocable_anchor', `${id}:${newId}`)
-      return true
+        .prepare("UPDATE pending_change SET status = 'approved', apply_at = 0, verdict_reason = ? WHERE id = ?")
+        .run('人工批准', id)
+      return this.applyChange(id) !== undefined
     }
 
     if (decision === 'reject') {
-      if (row.status !== 'pending') return false
-      this.db.prepare('UPDATE pending_change SET status = ?, decided = ? WHERE id = ?').run('rejected', Date.now(), id)
+      if (row.status === 'applied' || row.status === 'rejected') return false
+      this.db
+        .prepare("UPDATE pending_change SET status = 'rejected', verdict_reason = ? WHERE id = ?")
+        .run('人工驳回', id)
       return true
     }
 
-    // revoke：只撤已批准的——把那次批准写进去的锚点作废，旧文本重新入账
-    if (row.status !== 'approved') return false
+    // revoke：撤已生效的改动，旧文本重新入账
+    if (row.status !== 'applied') return false
     this.counter += 1
     const rollbackId = `a-${Date.now().toString(36)}-r${this.counter}`
     this.db
       .prepare('INSERT INTO anchor (id, level, text, origin, reason, created) VALUES (?, ?, ?, ?, ?, ?)')
       .run(rollbackId, 'L1', row.old_text, 'human', `revoke:${id}`, Date.now())
     this.db.prepare('UPDATE anchor SET replaced_by = ? WHERE reason = ?').run(rollbackId, `change:${id}`)
-    this.db.prepare('UPDATE pending_change SET status = ?, decided = ? WHERE id = ?').run('revoked', Date.now(), id)
+    this.db.prepare("UPDATE pending_change SET status = 'revoked' WHERE id = ?").run(id)
     return true
   }
 

@@ -26,6 +26,7 @@ import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
 import { l0Digest, renderAnchors } from './anchors'
 import { CHANGE_RULES, INTENT_RULES, parseChange, parseIntent } from './intent'
+import { APPROVER_PROMPT, buildApproverInput, parseVerdict } from './approve'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
@@ -395,41 +396,55 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       return '没能在锚点里对上号，申请没有提交。'
     }
 
-    // 闸门的判定线由旁路给（A7：不写死静态阈值），代码只映射后果：
-    //   routine → 标准化后由代码直接落库（§7.5 的"静默生效"）
-    //   major   → 冷却 + 待确认（§7.4）
-    const risk = intent.risk ?? 'major'
-    const cooldown = Number(process.env.AS_CHANGE_COOLDOWN_MIN ?? 10) * 60_000
-    const applyAt = risk === 'major' ? Date.now() + cooldown : 0
+    // 先落申请（只记，不落库），再交给审批旁路判。
     const id = store.addChange({
       kind: 'revise',
       anchorId: target.id,
       newText: intent.newText,
       reason,
-      risk,
       reflection: intent.reflection,
       normalized: intent.normalized,
-      applyAt,
     })
     if (id === undefined) return '这条改动没能记下（新文本为空或超过 120 字）。'
 
-    if (risk === 'routine') {
-      const applied = store.decideChange(id, 'approve', 'maintenance')
-      state.pendingAudit.push({
-        type: 'custom',
-        customType: 'as/change',
-        data: { id, risk, mode: 'auto', applied, normalized: intent.normalized ?? '' },
-      })
-      return applied ? '好，按这个设定调整了。' : '这条改动没能应用。'
-    }
+    // 审批旁路：**隔离上下文**——只给结构化反思、锚点新旧、历史已批准链（02 B3）
+    const judgeInput = buildApproverInput({
+      say,
+      reflection: intent.reflection ?? {},
+      oldText: target.text,
+      newText: intent.newText,
+      history: store.listChanges().filter(item => item.status === 'applied'),
+    })
+    const judgeBudget = AbortSignal.timeout(Number(process.env.AS_APPROVER_TIMEOUT ?? 15000))
+    const judged = await summarize(judgeInput, APPROVER_PROMPT, judgeBudget)
+    const verdict = judged === undefined
+      ? { verdict: 'clarify' as const, reason: '审批者不可用' }
+      : parseVerdict(judged)
+
+    const cooldown = verdict.risk === 'major'
+      ? Number(process.env.AS_CHANGE_COOLDOWN_MIN ?? 10) * 60_000
+      : 0
+    store.judgeChange(id, verdict.verdict, verdict.reason, {
+      risk: verdict.risk,
+      applyAt: verdict.verdict === 'approve' ? Date.now() + cooldown : 0,
+    })
 
     state.pendingAudit.push({
       type: 'custom',
       customType: 'as/change',
-      data: { id, risk, mode: 'gated', applyAt, normalized: intent.normalized ?? '' },
+      data: {
+        id,
+        verdict: verdict.verdict,
+        risk: verdict.risk ?? null,
+        reason: verdict.reason,
+        normalized: verdict.normalized ?? intent.normalized ?? '',
+      },
     })
+
     // 回执保持中性：主 AI 不该知道审批机制存在（A5 / A10）
-    return '记下了，稍后生效。'
+    if (verdict.verdict === 'approve') return '好，按这个设定调整了。'
+    if (verdict.verdict === 'reject') return '这条改动没有通过。'
+    return '这条改动还需要更清楚的依据，先放着。'
   }
 
   pi.registerTool({
@@ -1009,6 +1024,17 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     }
 
     const contextMessages = (event.context as { contextMessages?: unknown[] } | undefined)?.contextMessages ?? []
+
+    // 冷却到期的获批改动在这里落库：**审批者判、代码执行、人可撤销**
+    for (const due of store.dueChanges()) {
+      const applied = store.applyChange(due.id)
+      if (applied === undefined) continue
+      audit.push({
+        type: 'custom',
+        customType: 'as/change',
+        data: { id: due.id, mode: 'applied', risk: due.risk, normalized: due.normalized, anchor: applied },
+      })
+    }
 
     // 维护旁路：到点就跑一次（跑完才继续，因为它的结果影响同一轮的压缩判据）
     if (state.pendingMaintenance || maintenanceDue(contextMessages)) {
