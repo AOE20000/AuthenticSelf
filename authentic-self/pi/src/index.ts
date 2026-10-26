@@ -1073,10 +1073,11 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     const cue = state.cue
     const canInject = state.rounds < maxRounds && cue !== undefined && cue.text.length >= 20
-    // 候选多取一倍交给实时旁路筛。**直注已移除**：旁路是唯一闸门——
-    // 它说注入才注入，它不可用就宁可不注入（错注的代价大于漏注）
+    // **直注已移除**：旁路是唯一闸门——它说注入才注入，它不可用就宁可不注入。
+    // 候选多取几倍：时间已不参与排序（判读者看日期自己判），池子窄了它会看不到
+    // 更新但措辞不同的那条，也就无从替换。
     const exclude = new Set([...state.injected, ...state.dropped])
-    const picked = canInject ? store.recall(cue.text, perRecall * 2, exclude) : []
+    const picked = canInject ? store.recall(cue.text, perRecall * 3, exclude) : []
     let slots: Slot[] = picked.map((entry, index) => ({ entry, index: index + 1, text: entry.text }))
 
     if (canInject && realtimeOn) {

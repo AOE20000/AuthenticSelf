@@ -14,7 +14,7 @@
 | A2 | 单一层 + `span` 派生分流 | ✅ | `span` 由长度写；`long` 注入前交旁路裁决 full/excerpt/summary/skip，超预算降级并记审计（实测 `[记忆·节选]`） |
 | A3 | 来源分层 + trust | ✅ | `TRUST_BY_ORIGIN: user .9 / external .4 / model .5 / archive .6 / imported .3` |
 | A4 | 软抑制（不删） | ✅ | `suppress()` |
-| A5 | 三因子召回 | ✅ | `recall()` 三因子；`salience` 现由**下行反馈**调整（用到才 +0.05），`use_count` / `last_used` 自增。实测 `used 2/2` → salience 0.80→0.85 |
+| A5 | 召回打分 | ✅ | `score = relevance × salience × trust`（乘积，低于下限淘汰）；**`recency` 已于 2026-10-27 去掉**——注入改由旁路挑选且候选带日期，衰减成重复计算。`salience` 由下行反馈调整 |
 | A6 | 双通道召回（词 + 标签） | ✅ | `recall()` 标签段命中给满相关度；实测零正文重叠经 `记忆/用户/城市` 命中 |
 | A7 | 多轮注入 + 同句去重 + 审计 | ✅ | `state.injected` / `as/injection` |
 | A8 | 下行写入（"记住 X"） | ✅ | `message_end` 规则抽取；跨进程验证 |

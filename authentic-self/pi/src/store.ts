@@ -19,7 +19,17 @@ const LONG_THRESHOLD = 180
 export type EntryState = 'active' | 'merged' | 'superseded' | 'suppressed'
 
 /** 时近半衰期（天）。参照 Generative Agents 的指数衰减，但以天为单位。 */
-const RECENCY_HALF_LIFE_DAYS = 7
+/**
+ * 不再有"随时间衰减"的权重。
+ *
+ * 设计时（`01` §5.2）注入是"代码按分数排好再塞"，所以需要一个 recency 因子来压旧条目。
+ * 现在注入是**旁路统一挑选**（§5.1：候选 0..N 条由 R1 产出），且每条候选都带日期（§5.3），
+ * 陈旧与否由判读者看着日期决定——再在排序里乘一个衰减因子，等于把同一个信号算两遍。
+ *
+ * 所以排序只留三项客观属性：相关性、显著性、来源可信度，取**乘积**（忠于 §5.2 的
+ * "任一因子低于下限直接淘汰，不做补偿"）。
+ */
+
 
 /**
  * 单条标签的字数上限（**不计标点**）。
@@ -43,9 +53,9 @@ function textLength(value: string): number {
 }
 
 /** 三因子权重。三者归一后等权相加——照 Generative Agents 的做法。 */
-const W_RECENCY = 1
-const W_SALIENCE = 1
-const W_RELEVANCE = 1
+/** 淘汰下限：低于它直接出局，不参与排序（§5.2「不做补偿」）。 */
+const MIN_SALIENCE = 0.15
+const MIN_TRUST = 0.25
 
 /** 各来源的可信度上限。模型自述不得高于用户。 */
 const TRUST_BY_ORIGIN: Record<string, number> = {
@@ -429,11 +439,10 @@ export class Store {
       .map(({ row, hits, tagHit }) => {
         // 结构命中（标签）是比字面重叠更强的信号，直接给满相关度
         const relevance = Math.max(hits / maxHits, tagHit ? 1 : 0)
-        const ageDays = Math.max(0, (now - row.t_start) / 86_400_000)
-        const recency = Math.exp(-ageDays / RECENCY_HALF_LIFE_DAYS)
-        const score = W_RECENCY * recency + W_SALIENCE * row.salience + W_RELEVANCE * relevance
-        return { row, score }
+        const score = relevance * row.salience * row.trust
+        return { row, score, salience: row.salience, trust: row.trust }
       })
+      .filter(item => item.salience >= MIN_SALIENCE && item.trust >= MIN_TRUST)
       .sort((left, right) => right.score - left.score)
       // 同槽只出一条：叶=槽，槽内取现值（时间线天然由叶+时间构成）。
       // 未挂标签的条目互不相关，不受此限。
