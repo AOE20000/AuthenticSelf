@@ -29,6 +29,7 @@ import { CHANGE_RULES, INTENT_RULES, parseChange, parseIntent } from './intent'
 import { APPROVER_PROMPT, buildApproverInput, parseVerdict } from './approve'
 import { DIGEST_RULES, DOC_RULES, parseDigest, parseDocVerdict } from './digest'
 import { WRAPUP_RULES, parseWrapup } from './wrapup'
+import { PhaseGate } from './phase'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseMemoryBypass, MEMORY_RULES, renderCandidates } from './memory'
@@ -50,12 +51,10 @@ interface State {
   injected: Set<string>
   /** 本句被实时旁路 DROP 掉的条目——它们不能在后续轮次里再回来。 */
   dropped: Set<string>
-  /** 用户这一句的原文：turn 末的收尾调用要用（它拿不到历史消息）。 */
-  lastUserText: string
-  /** 已经收尾过的 turnIndex，避免多步注入时重复收尾。 */
-  wrapupTurn: number
   /** 上一次的完整回答：阶段一判用要用它。 */
   lastAnswer: string
+  /** 本轮注入是否已排定续步（agent 循环会再开一圈，相位门要认得它）。 */
+  continueScheduled: boolean
   /** 本句新写入库的条目，攒到 turn 末写一条审计。 */
   written: string[]
   /** 攒到 turn 末落盘的审计条目（压缩等事件无法当场追加）。 */
@@ -181,9 +180,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     rounds: 0,
     injected: new Set(),
     dropped: new Set(),
-    lastUserText: '',
-    wrapupTurn: -1,
     lastAnswer: '',
+    continueScheduled: false,
     written: [],
     pendingAudit: [],
     pressure: 0,
@@ -280,6 +278,9 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * @returns 给主 AI 看的回执。
    */
   async function handleMemoryIntent(say: string, target?: string): Promise<string> {
+    // 交涉需要当轮回执（D7），只在阻塞相受理
+    const admission = gate.require('交涉解析')
+    if (!admission.ok) return '交涉只在回答进行中受理，稍后再试。'
     const query = target ?? say
     // 交涉请求是**指代**，不是检索：用户会说"住处""那个项目"，与正文常常零重叠。
     // 所以召回不足时，直接把活跃条目摊给旁路挑——候选量有界（≤20 条短句）。
@@ -826,13 +827,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       state.userTurns += 1
       if (maintEvery > 0 && state.userTurns % maintEvery === 0) state.pendingMaintenance = true
 
-      state.lastUserText = plainText(event.message)
-
-      // 累计轮次：冷却的轮次维用它（§7.4）
-      store.setMeta('turn_total', String(Number(store.getMeta('turn_total') ?? 0) + 1))
-
-      // 写入不在这里做：不再用正则从用户原话里"抠"，改由实时旁路直接看思考内容
-      // 与回答后判断该留什么（`01` §5.1 / §5.5）。
+      // 轮次簿记（turn_total、相位门）在 agent_start：实测 message_end(user)
+      // 触发时机不稳定，不能当"轮开始"信号。
     }
 
     if (role === 'assistant') {
@@ -847,10 +843,19 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * 三件事同时机（都在 turn 结束后）、都不阻塞、共享同一份上下文——
    * 这正是"能合"的那一对（见 `01` §5.5：上行与下行不能合，但它们可以）。
    */
+  const gate = new PhaseGate()
   let pendingWrapup: Promise<void> | undefined
 
-  async function runWrapup(answer: string): Promise<void> {
-    const userSaid = state.lastUserText
+  async function runWrapup(answer: string, userSaid: string): Promise<void> {
+    const sediment = gate.require('沉淀')
+    if (!sediment.ok) {
+      if (debug) process.stderr.write(`[as] wrapup: 被相位门拒绝（${sediment.reason}）\n`)
+      return
+    }
+    // 收尾按轮去重：注入续步会让 agent_end 每圈触发一次，沉淀/预取每轮只做一次
+    const turnNow = Number(store.getMeta('turn_total') ?? 0)
+    if (store.getMeta('wrapped_turn') === String(turnNow)) return
+    store.setMeta('wrapped_turn', String(turnNow))
     if (userSaid === '' && answer === '') return
 
     const injected = store.pendingInjections(10)
@@ -902,24 +907,54 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     }
   }
 
-  pi.on('turn_end', async (event) => {
-    // turn_end 在多步注入时会重复触发（每一步都可能结束一次"turn"），
-    // 所以按 turnIndex 去重：同一轮只收尾一次，否则预取与判用会累积成灾。
-    const turnIndex = Number((event as { turnIndex?: number }).turnIndex ?? -1)
-    if (turnIndex >= 0) {
-      if (state.wrapupTurn === turnIndex) return
-      state.wrapupTurn = turnIndex
+  // agent_start = 用户一轮的开始。
+  // 轮次簿记放这里而不是 message_end(user)：实测 message_end 在 settle 之后才触发，
+  // 用它当"轮开始"信号会让检索相被相位门拒绝（迟到一轮）。
+  pi.on('agent_start', async () => {
+    // 注入续步会再开一圈 agent 循环：它仍是同一轮，相位保持阻塞，不重开轮次
+    if (state.continueScheduled) {
+      state.continueScheduled = false
+      if (debug) process.stderr.write('[as] gate: 续步循环 → 保持阻塞相\n')
+      return
     }
+    const nextTurn = Number(store.getMeta('turn_total') ?? 0) + 1
+    store.setMeta('turn_total', String(nextTurn))
+    gate.beginTurn(nextTurn)
+    if (debug) process.stderr.write(`[as] gate: beginTurn(${nextTurn}) → 阻塞相\n`)
+  })
 
-    const message = (event as { message?: { content?: unknown } }).message
-    const answer = Array.isArray(message?.content)
-      ? message.content.map(block => String((block as { text?: string }).text ?? '')).join('')
-      : ''
-    // 下一次的阶段一要用它判用；它必须是定稿的那一版
+  // agent_end = 整个 agent 循环结束（含工具调用与注入续步），这才是"turn 结束"。
+  // 之前用 turn_end 踩过坑：它在每条 assistant 消息后都触发，第一次就把门切到非阻塞，
+  // 后面的检索全被拒。
+  pi.on('agent_end', async (event) => {
+    const messages = (event as { messages?: { role?: string; content?: unknown }[] }).messages ?? []
+    const answer = messages
+      .filter(item => item.role === 'assistant')
+      .map(item => Array.isArray(item.content)
+        ? item.content.map(block => String((block as { text?: string }).text ?? '')).join('')
+        : '')
+      .join('\n')
     state.lastAnswer = answer
+    const lastUser = [...messages].reverse().find(item => item.role === 'user')
+    const userSaid = typeof lastUser?.content === 'string'
+      ? lastUser.content
+      : Array.isArray(lastUser?.content)
+        ? lastUser.content.map(block => String((block as { text?: string }).text ?? '')).join('')
+        : ''
+
+    // 注入续步的循环结束 ≠ turn 结束：回到阻塞相等下一个循环（或真正的 turn 末）
+    if (state.continueScheduled) {
+      state.continueScheduled = false
+      if (debug) process.stderr.write('[as] gate: 续步循环结束 → 回阻塞相\n')
+      return
+    }
+    // 相位门切到非阻塞；同周期内第二次 agent_end（不应发生）会被去重
+    if (debug) process.stderr.write('[as] gate: agent_end → 切非阻塞相\n')
+    if (!gate.endTurn()) return
+
     // 不阻塞：收尾失败只是这一轮不沉淀、不预取，不补写、不猜测（§5.1）。
     // 但要留个句柄：进程退出前得等它跑完，否则 pi -p 会在写库前就退出。
-    pendingWrapup = runWrapup(answer).catch(() => undefined)
+    pendingWrapup = runWrapup(answer, userSaid).catch(() => undefined)
   })
 
   // 关闭放在 session_shutdown：agent_settled 时收尾调用可能还在异步跑，
@@ -1049,6 +1084,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     cueText: string,
     current: Slot[],
   ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown }> {
+    // 相位门：检索只属于阻塞相（代码强制，不靠自觉）
+    const admission = gate.require('检索')
+    if (!admission.ok) {
+      if (debug) process.stderr.write(`[as] memory: 检索被相位门拒绝（${admission.reason}）\n`)
+      return undefined as never
+    }
     const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
     // 判用对象：**上一轮**注入的条目（它们的回答已经在上下文里，判得准）
     const injected = store.pendingInjections(10)
@@ -1115,6 +1156,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       .filter(slot => !dropSet.has(slot.index))
       .map(slot => ({ ...slot, text: rewrites.get(slot.index) ?? slot.text }))
 
+    gate.markSearched()
     if (debug) process.stderr.write(`[as] memory: drop ${drops.length}, rewrite ${rewrites.size}, remember ${remembered}\n`)
     return {
       slots,
@@ -1196,10 +1238,19 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     if (canInject && realtimeOn) {  // 开关沿用 AS_REALTIME，语义=阶段一开关
       const result = await runMemoryBypass(cue.text, slots)
-      slots = result.slots
+      if (result === undefined) {
+        // 被相位门拒绝：本步不注入，对话继续（错注的代价大于漏注）
+        audit.push({
+          type: 'custom',
+          customType: 'as/memory',
+          data: { skipped: true, reason: gate.violation() },
+        })
+      } else {
+        slots = result.slots
       // 被 DROP 的条目在本句内不得再回来（否则下一轮召回又会捞起来）
-      for (const id of result.droppedIds) state.dropped.add(id)
-      audit.push(result.audit)
+        for (const id of result.droppedIds) state.dropped.add(id)
+        audit.push(result.audit)
+      }
     } else if (canInject) {
       // 显式关闭实时旁路 = 显式关闭注入（没有直注可退）
       slots = []
@@ -1284,6 +1335,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     store.logInjection(finalPicked.map(entry => entry.id))
 
     const text = render(finalPicked, state.rounds)
+    // 排定了续步：agent 循环会再开一圈，相位门要认得它（否则第一圈结束时就被切到非阻塞）
+    state.continueScheduled = true
     return {
       entries: [
         ...audit,
