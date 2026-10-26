@@ -377,8 +377,15 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       key: Type.Optional(Type.String({ description: '时间粒度：2026 / 2026-10 / 2026-W44 / 2026-10-26 / 2026-10-26T14' })),
     }),
     async execute(_toolCallId: string, params: { key?: string }) {
+      const refs = store.archiveRefs()
+      // 只读也要留痕：事后能看出模型查了什么（D2 修订里的三条约束之一）
+      state.pendingAudit.push({
+        type: 'custom',
+        customType: 'as/archive_query',
+        data: { key: params.key ?? '', refs: refs.length },
+      })
       const text = await renderArchiveView(
-        store.archiveRefs(),
+        refs,
         params.key ?? '',
         ref => readExcerpt(ref.sessionFile, ref.turnTs, 400),
       )

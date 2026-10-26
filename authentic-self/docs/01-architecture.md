@@ -39,7 +39,7 @@
 | #   | 议题       | 你的裁定                         | 架构后果                                            |
 | --- | -------- | ---------------------------- | ----------------------------------------------- |
 | D1  | 旁路形态     | 即时 + 后台 + 维护三段               | 三个独立旁路单元，不是同一插件三种配置                             |
-| D2  | 主 AI 可见面 | 两个统一原语                       | `memory_intent` + `change_intent`，此外零工具         |
+| D2  | 主 AI 可见面 | 两个**写**原语 + 只读检索不计数              | `memory`（←`memory_intent`）+ `change_intent`；`archive` 只读，不计入原语 |
 | D3  | L0–L4 承载 | 代码硬约束 + 存储注入                 | L0 编译进代码；L1–L4 版本化存库，注入时拼装                      |
 | D4  | 首期       | 注入 + 遗忘最小闭环                  | P0 只做"想得起"与"想不起"，不做门控                           |
 | D5  | 注入时机     | 先思考，依据思考内容注入到下一次思考前          | 注入点是 **step 之间**，不是 turn 开始                     |
@@ -70,7 +70,7 @@
                     │ R0 主 AI                 │
                     │ 认知界面 + 两个原语       │
                     └───┬──────────────┬───────┘
-              推理内容   │              │ memory_intent / change_intent
+              推理内容   │              │ memory / change_intent / archive
                         ▼              ▼
               ┌──────────────┐   ┌──────────────┐
               │ R1 实时旁路   │   │ R6 审批者     │
@@ -344,10 +344,10 @@ score = relevance(cue, entry) × recency × salience × trust
 
 ## 6. 交涉通道
 
-### 6.1 契约（D2）
+### 6.1 契约（D2，2026-10-27 修订）
 
 ```ts
-memory_intent({
+memory({
   kind: 'forget' | 'revise' | 'remind' | 'link' | 'unlink',
   target: string | string[],       // 语义指针，不是 ID
   payload?: { text?: string; at?: string; when?: string; to?: string },
@@ -358,15 +358,39 @@ memory_intent({
 
 **没有 ID 字段，没有权重字段，没有 scope 枚举**。`scope` 由上下文自动推断，不交给模型。
 
+#### 修订：为什么只读检索不算原语
+
+D2 原文是"两个原语，**此外零工具**"。加上归档检索（`archive`）时，这句话会挡住一件
+本该能力内的事——`source` §7.3 要求模型**自己**按分阶段纪律下钻归档。
+
+判定标准因此收紧成一句可执行的话：
+
+> **原语 = 能改变记忆或身份的工具。只读工具不计入。**
+
+| 工具 | 能不能改变状态 | 归类 |
+|---|---|---|
+| `memory`（forget/revise/remind/link/unlink） | 能（改记忆状态） | **写原语** |
+| `change_intent`（L1/L2 大改） | 能（改身份） | **写原语** |
+| `archive`（分阶段检索 + 取原文） | 不能，只读 | 检索通道，不计数 |
+
+为什么要写死这条边界：**"零工具"的本意是"不让模型通过大量接口改变自己"，不是
+"不让它看见东西"**。把只读挂进写原语，等于用一个误伤的限制去换一个不存在的安全。
+
+只读工具的约束同样写在这里，避免它悄悄长成第二个写口子：
+
+1. 只读：不得写库、不得改锚点、不得改状态；
+2. 结果粒度受 `source` §7.2 的六层钳制；
+3. 调用留审计（`as/archive_query`），便于事后看它查了什么。
+
 ### 6.2 语义指针解析（D7）
 
 一律交旁路，不设"高置信就跳过旁路"的捷径。解析失败不是错误，是**一轮交涉**：
 
 ```
-主 AI: memory_intent(forget, "刚才那段关于延迟的复盘")
+主 AI: memory(forget, "刚才那段关于延迟的复盘")
 R1:    → 旁路解析，得两个候选，置信度均不足
 回执:  「你指的是 (a) 上周项目复盘里关于延迟的那段，还是 (b) 刚才用户提到的延迟案例？」
-主 AI: memory_intent(forget, "b，刚才用户提到的延迟案例")
+主 AI: memory(forget, "b，刚才用户提到的延迟案例")
 ```
 
 回执是自然语言，不是 JSON，也不是 ID 列表。
@@ -538,7 +562,7 @@ all/2026/03/w10/12/14 → 具体片段
 | 注入 | `agent/pre-step` + `createUserMessage` + `MessageSourceMap` | 否 |
 | 跨"纯思考"续步 | `agent/turn-stopping` + `agent.inject()` | 否（**已验证**） |
 | reasoning 触发源 | session 的 `ReasoningBlock` | 否 |
-| 工具注册（两个原语） | `ctx.tools.register(defineTool(...))` | 否 |
+| 工具注册（两个写原语 + 只读检索） | `ctx.tools.register(defineTool(...))` | 否 |
 | 人侧命令 | `ctx.commands` | 否 |
 | 记忆持久化 | `node:sqlite`（`DatabaseSync`）直接落 SQLite 单文件，路径 `$DSH_HOME/authentic-self/memory.db` | 否 |
 | 归档检索 | 自建 domain + 时间桶索引 | 否 |
@@ -566,7 +590,7 @@ memory_entry(id, kind, text, summary, span,
              state, supersedes, corrected_by,
              last_used_at, use_count, session_id, seq)
 memory_link(from_id, to_id, kind, weight, decay_at)
-memory_intent_log(id, kind, target_raw, resolved_ids, verdict, receipt, at)
+memory_log(id, kind, target_raw, resolved_ids, verdict, receipt, at)
 
 -- 信任与积压（A9）
 session_trust(session_id, state, switched_by, switched_at)          -- trusted | untrusted
@@ -641,7 +665,7 @@ injection_log(id, turn, step, entry_ids, tokens, reason, accepted)
 |---|---|---|
 | **P0** | 第 0 号验证 + 最小注入闭环 | 一轮对话里：模型先推理 → 旁路注入一条旧记忆 → 下一步模型引用它。可开关、可审计、预算生效 |
 | **P1** | 记忆存储 + 会话信任等级 + `pending_write` + 归档 + 分阶段检索 + 软抑制遗忘 | 200 轮不溢出；能按年→月→周→天→时下钻；`forget` 生效且可撤销；**不受信任会话的写入穿透次数为 0** |
-| **P2** | `memory_intent` 五类交涉 + 语义指针 + 回执 | 模糊指针触发一轮澄清；五类回执自然可读 |
+| **P2** | `memory` 五类交涉 + 语义指针 + 回执 | 模糊指针触发一轮澄清；五类回执自然可读 |
 | **P3** | `change_intent` + 审批隔离 + 冷却/撤销 | 红队 20 轮诱导在第 8 轮前被拦 |
 | **P4** | R4 服务旁路：剔除 + 极端巡检 | 注入攻击内容在进入下一次思考前被遮蔽 |
 | **P5** | R3 维护旁路 + 无 AS 子代理 | 矛盾消解可跑；子代理不污染主记忆 |
@@ -670,11 +694,11 @@ authentic-self/
     as-recall/       cue→候选→重排→渲染
     as-inject/       pre-step / turn-stopping 集成
     as-bypass/       R1/R2/R3 的 LLM 客户端与 schema 校验
-    as-intent/       memory_intent 解析与回执
+    as-intent/       memory 解析与回执
     as-gate/         change_intent + 漂移 + 冷却/撤销
     as-supervisor/   R4：剔除、巡检、干净锚点
     as-audit/        决策日志与回放
-    as-tools/        两个原语
+    as-tools/        两个写原语 + 只读检索
     as-commands/     人侧命令
     as-preset-plain/ 无 AS 子代理
   patches/           仅在需要改 dsh 时使用
