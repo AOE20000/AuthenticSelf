@@ -112,6 +112,11 @@
 
 不存在"条目库"与"文档库"两个实体，也不按长度分表。只有一个 `MemoryEntry`，长短是它身上一个**由代码服务算出来的派生标记**：
 
+> **实现状态（2026-10-26）**：下面的形状是**目标态**，不是现状。已实现：
+> `id / kind / text / span / source.origin / source.trust / sessionId / t.start / salience / confidence / state / supersededBy(replaced_by) / pinned / tag`。
+> 未实现（代码里没有对应列）：`summary`、`links`、`lastUsedAt`、`t.end`、`source.seq`、`correctedBy`（只有单向 `replaced_by`）。
+> `useCount` 列存在但**从不自增**——反馈器未接（见 `12-completeness.md` A5）。
+
 ```ts
 interface MemoryEntry {
   id: string

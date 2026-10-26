@@ -25,6 +25,8 @@ export interface MaintenanceResult {
     | { op: 'merge'; from: string; to: string }
     | { op: 'prune'; path: string }
   )[]
+  /** 被确认用上的注入：编号指向「最近注入的记忆」清单。 */
+  usages: number[]
 }
 
 /**
@@ -43,6 +45,7 @@ export const MAINTENANCE_RULES = [
   'MERGE_TAG <旧路径> <新路径>  ← 同义标签合并（深的并到浅的）',
   'PRUNE_TAG <路径>            ← 空枝或只有一条的深层路径，上提到父级',
   'REMEMBER <标签路径> | <一句话事实>   ← 这条值得长期记住，并归到这个标签下',
+  'USED <编号>                 ← 这条注入的记忆在那几轮回答里确实被用上了',
   'SUPERSEDE <旧编号> <新编号>   ← 旧记忆被新记忆取代（同一事实的新版本）',
   'MERGE <旧编号> <新编号>       ← 旧记忆的信息被新记忆完全包含',
   '',
@@ -74,6 +77,11 @@ export const MAINTENANCE_RULES = [
   '  旧的保留可查，但默认检索时要能看出它已被取代',
   '- MERGE：新记忆把旧记忆的信息全包了，还多了细节',
   '- 只是话题相关、或两条可以并存，**都不写**。乱合并会把记忆吃掉。',
+  '',
+  '什么时候 USED（这是"下行反馈"，决定权重）：',
+  '- 只有当回答里**实际体现了这条记忆的内容**（引用了它、按它改了结论）才写',
+  '- 只是"相关"不算；被注入但没被用到，**什么都不写**——那才是常态',
+  '- 编号指向「最近注入的记忆」清单，不是记忆清单',
   '',
   '原因字段用两三个字：commitment / pending / explicit / preference。',
 ].join('\n')
@@ -117,6 +125,7 @@ export function parseMaintenance(output: string): MaintenanceResult {
   const remembers: MaintenanceResult['remembers'] = []
   const relations: MaintenanceResult['relations'] = []
   const tagOps: MaintenanceResult['tagOps'] = []
+  const usages: number[] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
     if (line === '') continue
@@ -139,6 +148,12 @@ export function parseMaintenance(output: string): MaintenanceResult {
       tags.push(tag[1].trim())
       continue
     }
+    const used = /^USED\s+#?(\d+)$/iu.exec(line)
+    if (used !== null) {
+      const index = Number(used[1])
+      if (Number.isFinite(index)) usages.push(index)
+      continue
+    }
     const mergeTag = /^MERGE_TAG\s+(\S+)\s+(\S+)$/iu.exec(line)
     if (mergeTag !== null) {
       tagOps.push({ op: 'merge', from: mergeTag[1], to: mergeTag[2] })
@@ -158,5 +173,5 @@ export function parseMaintenance(output: string): MaintenanceResult {
       }
     }
   }
-  return { marks, tags, remembers, relations, tagOps }
+  return { marks, tags, remembers, relations, tagOps, usages }
 }

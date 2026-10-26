@@ -99,6 +99,15 @@ CREATE TABLE IF NOT EXISTS turn_mark (
   session   TEXT NOT NULL DEFAULT '',
   created   INTEGER NOT NULL
 );
+
+-- 注入日志：哪条记忆在哪一次被送进上下文。
+-- 只用于"事后判有没有被用上"——注入本身绝不提升权重（硬边界）。
+CREATE TABLE IF NOT EXISTS injection_log (
+  entry_id  TEXT NOT NULL,
+  created   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_injection_entry ON injection_log (entry_id);
 `
 
 export interface MemoryEntry {
@@ -201,6 +210,9 @@ export class Store {
     }
     if (!columns.some(column => column.name === 'tag_id')) {
       this.db.exec('ALTER TABLE memory_entry ADD COLUMN tag_id TEXT')
+    }
+    if (!columns.some(column => column.name === 'last_used')) {
+      this.db.exec('ALTER TABLE memory_entry ADD COLUMN last_used INTEGER')
     }
     this.ensureTag(ROOT_TAG)
     this.file = file
@@ -543,6 +555,60 @@ export class Store {
   getMeta(key: string): string | undefined {
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as unknown as { value: string } | undefined
     return row?.value
+  }
+
+  /**
+   * 记一条注入。**只记账，不动权重**——注入本身绝不提升显著性（硬边界）。
+   * @param ids - 本次注入的条目 id。
+   */
+  logInjection(ids: readonly string[]): void {
+    if (ids.length === 0) return
+    const statement = this.db.prepare('INSERT INTO injection_log (entry_id, created) VALUES (?, ?)')
+    const now = Date.now()
+    for (const id of ids) statement.run(id, now)
+  }
+
+  /**
+   * 待判定"有没有被用上"的注入：按条目去重，最近一次在前。
+   * @param limit - 最多给几条（旁路一次判不完太多）。
+   */
+  pendingInjections(limit = 10): { id: string; text: string }[] {
+    const rows = this.db.prepare(`
+      SELECT l.entry_id AS id, m.text AS text, MAX(l.created) AS last
+      FROM injection_log l JOIN memory_entry m ON m.id = l.entry_id
+      GROUP BY l.entry_id ORDER BY last DESC LIMIT ?
+    `).all(limit) as unknown as { id: string; text: string }[]
+    return rows.map(row => ({ id: row.id, text: row.text }))
+  }
+
+  /**
+   * 确认"这条被用上了"：使用计数 +1、记录最后使用时间、显著性微升。
+   *
+   * 只有**下行**（回答里真的用到了）才走这里；上行注入只记账。
+   * @param id - 条目 id。
+   * @returns 是否命中。
+   */
+  touch(id: string): boolean {
+    const result = this.db.prepare(`
+      UPDATE memory_entry
+      SET use_count = use_count + 1, last_used = ?, salience = MIN(1.0, salience + 0.05)
+      WHERE id = ?
+    `).run(Date.now(), id)
+    return Number(result.changes) > 0
+  }
+
+  /**
+   * 清掉判定过的注入记录，避免同一批被反复判。
+   * @param ids - 条目 id；**省略**则清空全部，**空数组**是无操作（不给就清全部，给空就什么都不清）。
+   */
+  clearInjections(ids?: readonly string[]): void {
+    if (ids === undefined) {
+      this.db.prepare('DELETE FROM injection_log').run()
+      return
+    }
+    if (ids.length === 0) return
+    const placeholders = ids.map(() => '?').join(',')
+    this.db.prepare(`DELETE FROM injection_log WHERE entry_id IN (${placeholders})`).run(...ids)
   }
 
   /** 写一个小值。 */

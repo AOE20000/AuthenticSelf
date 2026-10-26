@@ -493,11 +493,18 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     // 记忆清单：只给 active 的最近若干条，模型按编号判 merge / supersede
     const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
     const tagPaths = store.tagStats().map(stat => `${stat.path}(${stat.count})`)
+    // 下行反馈：最近被注入过的记忆，判有没有真的被用上（用到才涨权重）
+    const injected = store.pendingInjections(10)
     const transcript = [
       renderBatch(messages, window),
       '',
       '记忆清单（可引用编号）：',
       listed.length > 0 ? renderMemoryList(listed) : '（空）',
+      '',
+      '最近注入的记忆（判有没有被用上，编号只在这里有效）：',
+      injected.length > 0
+        ? injected.map((item, index) => `#${index + 1} ${item.text}`).join('\n')
+        : '（无）',
       '',
       '现有标签（优先复用；括号里是挂了几条）：',
       tagPaths.length > 0 ? tagPaths.slice(0, 60).join('、') : '（空）',
@@ -507,7 +514,18 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const text = await summarize(transcript, MAINTENANCE_RULES, budget)
     if (text === undefined) return undefined
 
-    const { marks, tags, tagOps, remembers, relations } = parseMaintenance(text)
+    const { marks, tags, tagOps, remembers, relations, usages } = parseMaintenance(text)
+
+    // 用到才涨：use_count +1、last_used、salience +0.05（没用到的不动）
+    let used = 0
+    for (const index of usages) {
+      const item = injected[index - 1]
+      if (item === undefined) continue
+      if (store.touch(item.id)) used += 1
+    }
+    // 判过就清账，避免同一批被反复判（判不出来的下一轮也不再纠缠）
+    store.clearInjections(injected.map(item => item.id))
+
     let marked = 0
     for (const mark of marks) {
       const turn = window.find(item => item.index === mark.turn)
@@ -556,12 +574,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       remembered += 1
     }
 
-    if (marked === 0 && tagged === 0 && remembered === 0 && related === 0) return undefined
-    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, tag ${tagged}, remember ${remembered}, relate ${related}\n`)
+    if (marked === 0 && tagged === 0 && remembered === 0 && related === 0 && used === 0) return undefined
+    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, tag ${tagged}, remember ${remembered}, relate ${related}, used ${used}/${injected.length}\n`)
     return {
       type: 'custom',
       customType: 'as/maint',
-      data: { marked, tagged, remembered, related, tagMoved, window: window.length },
+      data: { marked, tagged, remembered, related, tagMoved, used, window: window.length },
     }
   }
 
@@ -706,6 +724,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     state.rounds += 1
     for (const entry of finalPicked) state.injected.add(entry.id)
+    // 只记账：注入本身不涨权重，等维护旁路判"有没有被用上"
+    store.logInjection(finalPicked.map(entry => entry.id))
 
     const text = render(finalPicked, state.rounds)
     return {
