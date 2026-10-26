@@ -177,6 +177,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const maintWindow = Number(process.env.AS_MAINT_WINDOW ?? 10)
   const maintMemoryWindow = Number(process.env.AS_MAINT_MEMORY ?? 20)
   const realtimeOn = process.env.AS_REALTIME !== '0'
+  // 联想带的预算：`link` 禁止无预算扩散（01 §6.3），一次最多带出这么多条
+  const linkBudget = Number(process.env.AS_LINK_BUDGET ?? 2)
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -298,7 +300,21 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     } else if (intent.kind === 'remind') {
       outcome = `调出来了：${picked.text}`
     } else {
-      return `${intent.kind} 暂不支持，没有做任何改动。`
+      // link / unlink 需要两条：缺第二条就反问（拒绝必须附替代方案）
+      const second = intent.index2 === undefined ? undefined : candidates[intent.index2 - 1]
+      if (second === undefined) {
+        const options = candidates.slice(0, 4).map((entry, at) => `(${at + 1}) ${entry.text}`).join('；')
+        return `要关联两条，你只给了一条。候选里有这些：${options}——和哪一条？`
+      }
+      if (intent.kind === 'link') {
+        outcome = store.addLink(picked.id, second.id)
+          ? `已关联，最多带出 ${linkBudget} 条：${picked.text}／${second.text}`
+          : '这两条没连上（可能指向同一条或已不存在）。'
+      } else {
+        outcome = store.removeLink(picked.id, second.id)
+          ? `已解除：${picked.text}／${second.text}`
+          : '这两条本来就没有关联。'
+      }
     }
 
     state.pendingAudit.push({
@@ -1063,7 +1079,18 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       slots = []
     }
 
-    const finalPicked = slots.slice(0, perRecall).map(slot => ({ ...slot.entry, text: slot.text }))
+    const basePicked = slots.slice(0, perRecall).map(slot => ({ ...slot.entry, text: slot.text }))
+    // 联合注入：命中即带出显式联想边，但**受预算限制**（01 §6.3 禁止无预算扩散）
+    const linkedExtra: typeof basePicked = []
+    for (const entry of basePicked) {
+      for (const extra of store.linkedEntries(entry.id, linkBudget)) {
+        if (state.injected.has(extra.id) || state.dropped.has(extra.id)) continue
+        if (basePicked.some(item => item.id === extra.id)) continue
+        if (linkedExtra.some(item => item.id === extra.id)) continue
+        linkedExtra.push(extra)
+      }
+    }
+    const finalPicked = [...basePicked, ...linkedExtra.slice(0, linkBudget)]
 
     if (finalPicked.length === 0) {
       return audit.length > 0 ? { entries: audit as never[] } : undefined

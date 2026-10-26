@@ -26,7 +26,7 @@
 | A14 | 维护旁路（打标/补记/关系/标签整理） | ✅ | `maintain.ts`；节拍持久化于 `meta.maint_last` |
 | A15 | 实时旁路（注入决策 + 冲突合并 + 写入） | ✅ | `realtime.ts`；`DROP/REWRITE/REMEMBER` 实测 |
 | A16 | 标签树（根保护、逐层创建、≤7 字） | ✅ | `ensureTag`；单测 17 项 |
-| A17 | 主 AI 自判写入 / `memory` 单一工具 | 🟡 | 工具已在（`memory({say,target})`，旁路解析 FORGET/REVISE/REMIND）；**主 AI 自判写入**与 `change_intent`（L1/L2 大改）未做 |
+| A17 | 主 AI 自判写入 / `memory` 单一工具 | ✅ | 五类齐：FORGET（软抑制）/ REVISE（supersede）/ REMIND / LINK（双向显式边 + 预算）/ UNLINK（显式删、隐式降权）；另有 `change` 申请通道 |
 | A18 | 交涉通道（自然语言 → 旁路解析） | ✅ | 实测 `intent: forget` → 条目转 `suppressed`（正文仍在库）；下一轮不再注入 |
 | A19 | 归档检索（分阶段下钻） | ✅ | 六层粒度钳制（所有→年→月→周→天→时），≤3 段直接给片段，到"时"给原文；R3 取原文已实测 |
 | A20 | 剔除（发送视图） | ⬜ | 钩子能力已确认，未实现 |
@@ -81,7 +81,7 @@
 | `state` | ✅（active / suppressed / superseded / merged） |
 | `supersedes / correctedBy` | 🟡（只有 `replaced_by` 单向指针） |
 | `summary` | ⬜ |
-| `links` | ⬜ |
+| `links` | ✅（独立 `memory_link` 表，kind/weight；显式参与带出，隐式只降权） |
 | `lastUsedAt / useCount` | ✅（`last_used` / `use_count`，由下行反馈写入） |
 
 ---
@@ -160,11 +160,11 @@
 
 | 状态 | 条目数 |
 |---|---|
-| ✅ 完成 | 23 |
+| ✅ 完成 | 25 |
 | 🟡 部分 | 13 |
-| ⬜ 未做 | 16 |
+| ⬜ 未做 | 14 |
 
-**完成度 ≈ 44%（23/52），部分完成另占 25%。**
+**完成度 ≈ 48%（25/52），部分完成另占 25%。**
 
 ### 真正的空洞在哪
 

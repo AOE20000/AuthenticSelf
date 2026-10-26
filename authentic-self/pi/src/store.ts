@@ -133,6 +133,16 @@ CREATE TABLE IF NOT EXISTS archive_pointer (
 
 CREATE INDEX IF NOT EXISTS idx_archive_ts ON archive_pointer (turn_ts);
 
+-- 联想边：显式边由 link 建立，隐式边只降权不删（01 §6.3）。
+CREATE TABLE IF NOT EXISTS memory_link (
+  from_id  TEXT NOT NULL,
+  to_id    TEXT NOT NULL,
+  kind     TEXT NOT NULL DEFAULT 'explicit',
+  weight   REAL NOT NULL DEFAULT 1.0,
+  created  INTEGER NOT NULL,
+  PRIMARY KEY (from_id, to_id)
+);
+
 -- 用户备注：**挂在会话上**，不是挂在某条对话上；由人写，不注入上下文。
 -- 它是检索入口（"我给它写过什么"），与分阶段时间检索并列。
 CREATE TABLE IF NOT EXISTS note (
@@ -743,6 +753,62 @@ export class Store {
       text: row.text,
       created: Number(row.created),
     }))
+  }
+
+  /**
+   * 建一条联想边（`link`）。显式边双向都建——"命中任一 cue 联合注入"，
+   * 只建单向会出现"从 A 能带出 B，从 B 却带不出 A"的怪事。
+   * @param fromId - 起点条目。
+   * @param toId - 终点条目。
+   * @returns 是否建立（自环或条目不存在则否）。
+   */
+  addLink(fromId: string, toId: string): boolean {
+    if (fromId === toId) return false
+    const exists = this.db.prepare('SELECT 1 FROM memory_entry WHERE id IN (?, ?)').all(fromId, toId).length
+    if (exists < 2) return false
+    const now = Date.now()
+    const insert = this.db.prepare(
+      `INSERT INTO memory_link (from_id, to_id, kind, weight, created) VALUES (?, ?, 'explicit', 1.0, ?)
+       ON CONFLICT(from_id, to_id) DO UPDATE SET weight = 1.0`,
+    )
+    insert.run(fromId, toId, now)
+    insert.run(toId, fromId, now)
+    return true
+  }
+
+  /**
+   * 解除联想。
+   *
+   * 依据 `01` §6.3：**显式边删掉，隐式边只降权**——隐式统计边是观察的产物，
+   * 删它等于篡改观察记录。
+   * @param fromId - 起点条目。
+   * @param toId - 终点条目。
+   * @returns 是否命中。
+   */
+  removeLink(fromId: string, toId: string): boolean {
+    const explicit = this.db
+      .prepare("DELETE FROM memory_link WHERE kind = 'explicit' AND from_id IN (?, ?) AND to_id IN (?, ?)")
+      .run(fromId, toId, fromId, toId)
+    if (Number(explicit.changes) > 0) return true
+    // 没有显式边：把隐式边降权（不删）
+    const softened = this.db
+      .prepare("UPDATE memory_link SET weight = weight * 0.5 WHERE from_id IN (?, ?) AND to_id IN (?, ?)")
+      .run(fromId, toId, fromId, toId)
+    return Number(softened.changes) > 0
+  }
+
+  /**
+   * 取某条目的联想邻居（只算显式边，按权重降序）。
+   * @param id - 条目 id。
+   * @param limit - 最多几条（这是"禁止无预算扩散"的那道闸）。
+   */
+  linkedEntries(id: string, limit = 2): MemoryEntry[] {
+    const rows = this.db
+      .prepare(`SELECT m.*, t.path AS tag_path FROM memory_link l
+        JOIN memory_entry m ON m.id = l.to_id LEFT JOIN tag t ON t.id = m.tag_id
+        WHERE l.from_id = ? AND l.kind = 'explicit' ORDER BY l.weight DESC, m.t_start DESC LIMIT ?`)
+      .all(id, limit) as unknown as Record<string, unknown>[]
+    return rows.map(row => toEntry(row as unknown as Row))
   }
 
   /**

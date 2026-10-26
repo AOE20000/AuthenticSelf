@@ -13,10 +13,12 @@
 
 /** 一次交涉请求的解析结果。 */
 export interface IntentResult {
-  /** 动作。link/unlink 暂不支持，解析出来也会被拒。 */
+  /** 动作。 */
   kind: 'forget' | 'revise' | 'remind' | 'link' | 'unlink' | 'none'
-  /** 指向的候选编号。 */
+  /** 指向的候选编号（单目标动作）。 */
   index?: number
+  /** link/unlink 的第二个编号（需要两条）。 */
+  index2?: number
   /** revise 的新文本。 */
   text?: string
 }
@@ -33,12 +35,14 @@ export const INTENT_RULES = [
   'FORGET <编号>              ← 不要再提这条（软抑制，不是删除）',
   'REVISE <编号> | <新文本>    ← 这条记错了，改成新文本（旧版保留可查）',
   'REMIND <编号>              ← 现在就把这条调出来用',
-  'LINK <编号> / UNLINK <编号> ← 关联/解除关联（暂不支持，但仍可标注）',
+  'LINK <编号> <编号>         ← 把这两条关联起来（联想边）',
+  'UNLINK <编号> <编号>       ← 解除这两条的关联',
   'NONE                       ← 无法确定，或没有合适的候选',
   '',
   '规则：',
   '- 只能从候选里挑，不要编造编号',
   '- 「忘掉/别再提/删掉」→ FORGET；「记错了/应该是/改成」→ REVISE；「上次说的那个」→ REMIND',
+  '- 「这两条有关/是同一件事的两面」→ LINK，必须给两个编号；「别再联想了」→ UNLINK',
   '- 请求指向的东西在候选里找不到 → NONE。宁可不做，不要改错',
   '- 涉及身份、长期承诺的修改（改称呼、改原则）→ NONE：那要走 change 通道，不是 memory',
 ].join('\n')
@@ -57,9 +61,13 @@ export function parseIntent(output: string): IntentResult {
     if (revise !== null) return { kind: 'revise', index: Number(revise[1]), text: revise[2].trim() }
     const remind = /^REMIND\s+#?(\d+)$/iu.exec(line)
     if (remind !== null) return { kind: 'remind', index: Number(remind[1]) }
-    const link = /^(LINK|UNLINK)\s+#?(\d+)$/iu.exec(line)
+    const link = /^(LINK|UNLINK)\s+#?(\d+)\s+#?(\d+)$/iu.exec(line)
     if (link !== null) {
-      return { kind: link[1].toUpperCase() === 'LINK' ? 'link' : 'unlink', index: Number(link[2]) }
+      return {
+        kind: link[1].toUpperCase() === 'LINK' ? 'link' : 'unlink',
+        index: Number(link[2]),
+        index2: Number(link[3]),
+      }
     }
     if (/^NONE$/iu.test(line)) return { kind: 'none' }
   }
