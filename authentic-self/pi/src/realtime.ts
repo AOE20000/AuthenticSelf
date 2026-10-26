@@ -20,8 +20,8 @@ export interface RealtimeResult {
   drops: number[]
   /** 重写后注入：编号 → 新文本。 */
   rewrites: Map<number, string>
-  /** 要写入的事实（带标签路径）。 */
-  remembers: { tagPath?: string; text: string }[]
+  /** 要写入的事实（带标签路径与来源）。 */
+  remembers: { tagPath?: string; text: string; origin?: 'user' | 'model' }[]
 }
 
 /**
@@ -38,7 +38,7 @@ export const REALTIME_RULES = [
   '输出格式（每行一条；全部可省略——没有要改的就什么都不输出）：',
   'DROP <编号>                    ← 这条本轮不该注入',
   'REWRITE <编号> | <新文本>       ← 重写后再注入',
-  'REMEMBER <标签路径> | <一句话事实>   ← 写入长期记忆',
+  'REMEMBER <user|model> <标签路径> | <一句话事实>   ← 写入长期记忆（第一项是来源）',
   '',
   '什么时候 DROP（只用于无关候选）：',
   '- 候选与本轮思考无关，或明显过时且已有新版本',
@@ -59,6 +59,8 @@ export const REALTIME_RULES = [
   '',
   '什么时候 REMEMBER（只记下次还用得上的）：',
   '- 稳定的事实：项目、选型、长期偏好、身份、重要决定',
+  '- **来源必须分清**：用户明确说过的事 → `user`；你自己总结、推断、归纳出来的 → `model`。',
+  '  把推断写成 user 是幻觉固化的第一步，宁可用 model',
   '- **一律用第三人称书写**（「用户…」或主语明确的句子），不写「我」——',
   '  来源:user 的原话可以保留「我」（那是用户的话），整理产物不要',
   '- 路径写在根 `记忆` 之下（`记忆/用户/住所`），优先复用现有标签；',
@@ -120,11 +122,14 @@ export function parseRealtime(output: string): RealtimeResult {
       if (text !== '') rewrites.set(Number(rewrite[1]), text)
       continue
     }
-    const remember = /^REMEMBER\s+(?:([^|]+?)\s*\|\s*)?(.+)$/iu.exec(line)
+    const remember = /^REMEMBER\s+(user|model)\s+(?:([^|]+?)\s*\|\s*)?(.+)$/iu.exec(line)
     if (remember !== null) {
-      const tagPath = remember[1]?.trim()
-      const text = remember[2]?.trim() ?? ''
-      if (text.length >= 4) remembers.push(tagPath === undefined || tagPath === '' ? { text } : { tagPath, text })
+      const origin = remember[1].toLowerCase() === 'user' ? 'user' : 'model'
+      const tagPath = remember[2]?.trim()
+      const text = remember[3]?.trim() ?? ''
+      if (text.length >= 4) {
+        remembers.push(tagPath === undefined || tagPath === '' ? { text, origin } : { tagPath, text, origin })
+      }
     }
   }
   return { drops, rewrites, remembers }

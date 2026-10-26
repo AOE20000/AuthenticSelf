@@ -117,29 +117,6 @@ function readMessage(message: unknown): { text: string; kind: 'reasoning' | 'fal
   return text.length > 0 ? { text, kind: 'fallback' } : undefined
 }
 
-/**
- * 从用户发言里抽"明确要记住"的内容。
- *
- * 只认显式句式——这是沉默成本最低、误写代价也最低的入口。
- * 判不出来就不写，宁缺毋滥：写错一条，之后每次召回都要还债。
- * @param text - 用户这一句的正文。
- * @returns 抽到的内容，没有则空数组。
- */
-function extractExplicit(text: string): string[] {
-  const patterns = [
-    /(?:请|帮我)?(?:记住|记下|记一下)[：:，,]?\s*([^\n。！？]{4,})/gu,
-    /(?:别忘了|不要忘记|以后都)[：:，,]?\s*([^\n。！？]{4,})/gu,
-  ]
-  const out: string[] = []
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      const value = match[1]?.trim()
-      if (value !== undefined && value.length >= 4) out.push(value)
-    }
-  }
-  return out
-}
-
 /** print / json 模式下没有 UI，通知要能静默失败。 */
 function notify(ctx: unknown, message: string): void {
   const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void } }).ui
@@ -842,16 +819,10 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       // 累计轮次：冷却的轮次维用它（§7.4）
       store.setMeta('turn_total', String(Number(store.getMeta('turn_total') ?? 0) + 1))
 
-      // 下行写入：只认显式句式（"记住 X"），其余交给旁路判断
-      for (const fact of extractExplicit(plainText(event.message))) {
-        const existing = store.findSimilar(fact)
-        if (existing !== undefined) continue
-        const entry = store.add(fact, { origin: 'user', salience: 0.8 })
-        void judgeDoc(entry.id, entry.text)
-        state.written.push(entry.id)
-      }
-      return
+      // 写入不在这里做：不再用正则从用户原话里"抠"，改由实时旁路直接看思考内容
+      // 与回答后判断该留什么（`01` §5.1 / §5.5）。
     }
+
     if (role === 'assistant') {
       const cue = readMessage(event.message)
       if (cue !== undefined) state.cue = cue
@@ -866,8 +837,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * 维护旁路：每 N 轮回头看一次。
    *
    * 它只做两件事——打标（哪些轮非留不可）、补记（哪些事实值得长期记住）。
-   * 打标写进 `turn_mark`，压缩侧只读；补记走与"记住 X"同一条写库路径，但来源是模型，
-   * 所以 trust 更低。
+   * 打标写进 `turn_mark`，压缩侧只读；补记与实时旁路共用一条写库路径，
+   * 但维护旁路看不到当时的思考，来源只能是模型，所以 trust 更低。
    * @param messages - 当前会话消息。
    * @returns 一条审计条目；什么都没判出来时为 undefined。
    */
@@ -1032,7 +1003,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     let remembered = 0
     for (const fact of remembers) {
       if (store.findSimilar(fact.text) !== undefined) continue
-      const written = store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath })
+      const origin = fact.origin ?? 'model'
+      const written = store.add(fact.text, {
+        origin,
+        salience: origin === 'user' ? 0.8 : 0.6,
+        tagPath: fact.tagPath,
+      })
       void judgeDoc(written.id, written.text)
       remembered += 1
     }
