@@ -83,6 +83,8 @@ CREATE TABLE IF NOT EXISTS memory_entry (
   replaced_by  TEXT,
   tag_id       TEXT,
   pinned       INTEGER NOT NULL DEFAULT 0,
+  doc_verdict  TEXT NOT NULL DEFAULT '',
+  doc_reason   TEXT NOT NULL DEFAULT '',
   use_count    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_entry_state ON memory_entry (state, t_start);
@@ -198,6 +200,10 @@ export interface MemoryEntry {
   /** 被哪一条取代（merged / superseded 时有值）。 */
   replacedBy?: string
   pinned: boolean
+  /** 写入时的转存判断：`doc` 表示「这条本该是文档」，空串表示未判。 */
+  docVerdict: string
+  /** 转存判断的理由。 */
+  docReason: string
 }
 
 /** 库文件默认位置：`$PI_HOME/agent/authentic-self/memory.db`。 */
@@ -262,6 +268,8 @@ function toEntry(row: Row): MemoryEntry {
     ...row.tag_path === null ? {} : { tag: row.tag_path },
     ...row.replaced_by === null ? {} : { replacedBy: row.replaced_by },
     pinned: row.pinned === 1,
+    docVerdict: String(row.doc_verdict ?? ''),
+    docReason: String(row.doc_reason ?? ''),
   }
 }
 
@@ -285,6 +293,13 @@ export class Store {
     }
     if (!columns.some(column => column.name === 'last_used')) {
       this.db.exec('ALTER TABLE memory_entry ADD COLUMN last_used INTEGER')
+    }
+    const docColumns = this.db.prepare('PRAGMA table_info(memory_entry)').all() as unknown as { name: string }[]
+    if (!docColumns.some(column => column.name === 'doc_verdict')) {
+      this.db.exec("ALTER TABLE memory_entry ADD COLUMN doc_verdict TEXT NOT NULL DEFAULT ''")
+    }
+    if (!docColumns.some(column => column.name === 'doc_reason')) {
+      this.db.exec("ALTER TABLE memory_entry ADD COLUMN doc_reason TEXT NOT NULL DEFAULT ''")
     }
     const changeColumns = this.db.prepare('PRAGMA table_info(pending_change)').all() as unknown as { name: string }[]
     if (!changeColumns.some(column => column.name === 'apply_turn')) {
@@ -1082,6 +1097,21 @@ export class Store {
       chars: Number(row.chars),
       sessionFile: row.session_file,
     }))
+  }
+
+  /**
+   * 记下写入时的转存判断（`doc` / `memory`）。
+   *
+   * 判在**写入时**而不是每次注入时：一条记忆是不是"本该写成文档"，是内容自身的属性，
+   * 不会因为某次提问而改变；每轮重判既费一次调用，又会给出前后不一致的答案。
+   * @param id - 条目 id。
+   * @param verdict - `doc` / `memory`。
+   * @param reason - 一句话理由（人用 `/as-memory` 看）。
+   */
+  setDocVerdict(id: string, verdict: 'doc' | 'memory', reason: string): void {
+    this.db
+      .prepare('UPDATE memory_entry SET doc_verdict = ?, doc_reason = ? WHERE id = ?')
+      .run(verdict, reason.trim().slice(0, 200), id)
   }
 
   /** 写一个小值。 */

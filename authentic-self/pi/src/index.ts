@@ -27,7 +27,7 @@ import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } 
 import { l0Digest, renderAnchors } from './anchors'
 import { CHANGE_RULES, INTENT_RULES, parseChange, parseIntent } from './intent'
 import { APPROVER_PROMPT, buildApproverInput, parseVerdict } from './approve'
-import { DIGEST_RULES, parseDigest } from './digest'
+import { DIGEST_RULES, DOC_RULES, parseDigest, parseDocVerdict } from './digest'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
@@ -214,7 +214,10 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     try {
       const items: unknown = JSON.parse(seed)
       if (Array.isArray(items)) {
-        for (const item of items) store.add(String(item), { origin: 'user', salience: 0.8 })
+        for (const item of items) {
+          const entry = store.add(String(item), { origin: 'user', salience: 0.8 })
+          void judgeDoc(entry.id, entry.text)
+        }
       }
     } catch (error) {
       process.stderr.write(`[authentic-self] AS_SEED 解析失败：${String(error)}\n`)
@@ -249,11 +252,36 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       }
       const lines = entries.slice(0, 20).map(entry => {
         const tail = entry.replacedBy === undefined ? '' : ` → ${entry.replacedBy}`
-        return `${entry.state.padEnd(10)} [${entry.tag ?? '未分类'}] ${entry.text.slice(0, 36)}${tail}`
+        const doc = entry.docVerdict === 'doc' ? `  ※建议转存文档（${entry.docReason || '未给理由'}）` : ''
+        return `${entry.state.padEnd(10)} [${entry.tag ?? '未分类'}] ${entry.text.slice(0, 36)}${tail}${doc}`
       })
       notify(ctx, [`记忆库（${entries.length} 条 / ${store.tagPaths().length} 个标签，显示前 20）`, ...lines].join('\n'), 'info')
     },
   })
+
+  /**
+   * 写入时的转存判断（`01` §4.1）。
+   *
+   * 只对长条目跑一次，结果**存进库里**——"该不该是文档"是内容自身的属性，
+   * 不因为某次提问而改变；每轮重判既费调用，又会给出前后不一致的答案。
+   * @param id - 刚写入的条目。
+   * @param text - 条目正文。
+   */
+  async function judgeDoc(id: string, text: string): Promise<void> {
+    if (text.length <= 180) return
+    const budget = AbortSignal.timeout(Number(process.env.AS_DOC_TIMEOUT ?? 12000))
+    const judged = await summarize(`【长内容】\n${text.slice(0, 1200)}`, DOC_RULES, budget)
+    if (judged === undefined) return
+    const { verdict, reason } = parseDocVerdict(judged)
+    store.setDocVerdict(id, verdict, reason)
+    if (verdict === 'doc') {
+      state.pendingAudit.push({
+        type: 'custom',
+        customType: 'as/doc_suggest',
+        data: { id, reason },
+      })
+    }
+  }
 
   /**
    * 交涉通道：主 AI 唯一能主动动记忆的入口。
@@ -819,6 +847,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
         const existing = store.findSimilar(fact)
         if (existing !== undefined) continue
         const entry = store.add(fact, { origin: 'user', salience: 0.8 })
+        void judgeDoc(entry.id, entry.text)
         state.written.push(entry.id)
       }
       return
@@ -931,7 +960,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       // 语义级的改写副本**故意不拦**——确定性过滤的误判要 AuthenticSelf 来修，
       // 而模型的误判会随模型更新自然恢复。代价是偶尔多一条，可接受。
       if (store.findSimilar(fact.text) !== undefined) continue
-      store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath ?? '其他' })
+      const added = store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath ?? '其他' })
+      void judgeDoc(added.id, added.text)
       remembered += 1
     }
 
@@ -1002,7 +1032,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     let remembered = 0
     for (const fact of remembers) {
       if (store.findSimilar(fact.text) !== undefined) continue
-      store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath })
+      const written = store.add(fact.text, { origin: 'model', salience: 0.6, tagPath: fact.tagPath })
+      void judgeDoc(written.id, written.text)
       remembered += 1
     }
 
@@ -1155,8 +1186,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
           excerpt: finalPicked.filter(entry => entry.span === 'long' && entry.mode === 'excerpt').length,
           summary: finalPicked.filter(entry => entry.span === 'long' && entry.mode === 'summary').length,
           skipped: longOnes.length - finalPicked.filter(entry => entry.span === 'long').length,
-          // 选 full 却答不出"为什么不写成文档" → 建议转存（§4.1）
-          recommendDoc: decisions.filter(item => item.mode === 'full' && (item.whynot ?? '') === '').length,
+          // 转存判断已在写入时落库（doc_verdict），这里不再重判
         },
       })
     }

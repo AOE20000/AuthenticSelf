@@ -11,7 +11,7 @@
 | # | 文档要求 | 现状 | 证据 / 差距 |
 |---|---|---|---|
 | A1 | 记忆落盘 SQLite，不易直读 | ✅ | `store.ts` DDL；二进制页格式 |
-| A2 | 单一层 + `span` 派生分流 | ✅ | `span` 由长度写；`long` 注入前交旁路裁决 full/excerpt/summary/skip，超预算降级并记审计（实测 `[记忆·节选]`） |
+| A2 | 单一层 + `span` 派生分流 | ✅ | `span` 由长度写；`long` 注入前交旁路裁决 full/excerpt/summary/skip，超预算降级并记审计；**该不该是文档在写入时判一次**（`doc_verdict` + `/as-memory` 显示） |
 | A3 | 来源分层 + trust | ✅ | `TRUST_BY_ORIGIN: user .9 / external .4 / model .5 / archive .6 / imported .3` |
 | A4 | 软抑制（不删） | ✅ | `suppress()` |
 | A5 | 召回打分 | ✅ | `score = relevance × salience × trust`（乘积，低于下限淘汰）；**`recency` 已于 2026-10-27 去掉**——注入改由旁路挑选且候选带日期，衰减成重复计算。`salience` 由下行反馈调整 |
