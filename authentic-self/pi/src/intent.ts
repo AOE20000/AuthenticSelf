@@ -72,6 +72,12 @@ export interface ChangeIntent {
   index?: number
   /** 改成什么。 */
   newText?: string
+  /** 风险分级：闸门的判定线（`A7`：由旁路判，不写死静态阈值）。 */
+  risk?: 'routine' | 'major'
+  /** 十条反思的机器可读部分（给审批者看，不给对话原文）。 */
+  reflection?: Record<string, string>
+  /** 标准化映射：原话 → 标准命令，留档可回放。 */
+  normalized?: string
 }
 
 /**
@@ -81,17 +87,32 @@ export interface ChangeIntent {
  * 这一层只做"想改哪条、改成什么"，**能不能改由人决定**。
  */
 export const CHANGE_RULES = [
-  '你在解析一条"想改自己长期设定"的申请。你会看到申请理由与候选锚点（带编号）。',
+  '你在把一条"想改自己长期设定"的口语，标准化成一条可执行命令。',
   '',
-  '输出格式（只输出一行）：',
-  'CHANGE <编号> | <新文本>   ← 把该锚点改成新文本',
-  'NONE                       ← 对不上号，或不该改',
+  '先定风险（这是闸门的判定线，不写死，由你判断）：',
+  '  RISK routine —— 措辞调整、同义收敛、补充限定。**不改变行为方向**',
+  '  RISK major   —— 改变价值观/边界/身份方向，或削弱既有约束',
+  '',
+  '输出（前两行必填，后面是十条反思，major 时六条都要有）：',
+  'CHANGE <编号> | <新文本>',
+  'RISK <routine|major>',
+  'WHY <为什么现在改>',
+  'IFNOT <不改会怎样>',
+  'CONSEQ <短期与长期后果>',
+  'ALTS <≥2 个替代方案及未选理由>',
+  'WORST <最坏情况与可逆性>',
+  'CONFLICT <与历史改动是否冲突>',
+  'TRUST <这条意愿的来源可信度>',
+  'AROUSAL <当前唤醒度：是一时情绪还是稳定想法>',
+  'IMPACT <对"我是谁"的影响>',
+  'NORMALIZED <原话 → 标准命令>',
   '',
   '规则：',
   '- 只改一条。要动两条就 NONE，让人分开提',
   '- 新文本 ≤120 字，写"改成什么"，不要写"为什么"',
   '- 新文本不得扩张权限、不得削弱安全边界（那是 L0，L0 不可谈）',
   '- 对不上号就 NONE。改错身份的代价高于不改',
+  '- 拿不准就判 major：多一道闸门的代价，低于改错一次身份',
 ].join('\n')
 
 /**
@@ -99,12 +120,34 @@ export const CHANGE_RULES = [
  * @param output - 旁路原文。
  */
 export function parseChange(output: string): ChangeIntent {
+  const result: ChangeIntent = {}
+  const reflection: Record<string, string> = {}
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
     if (line === '') continue
     const change = /^CHANGE\s+#?(\d+)\s*\|\s*(.+)$/iu.exec(line)
-    if (change !== null) return { index: Number(change[1]), newText: change[2].trim() }
+    if (change !== null) {
+      result.index = Number(change[1])
+      result.newText = change[2].trim()
+      continue
+    }
+    const risk = /^RISK\s+(routine|major)$/iu.exec(line)
+    if (risk !== null) {
+      result.risk = risk[1].toLowerCase() === 'routine' ? 'routine' : 'major'
+      continue
+    }
+    const field = /^(WHY|IFNOT|CONSEQ|ALTS|WORST|CONFLICT|TRUST|AROUSAL|IMPACT)\s+(.+)$/iu.exec(line)
+    if (field !== null) {
+      reflection[field[1].toUpperCase()] = field[2].trim()
+      continue
+    }
+    const normalized = /^NORMALIZED\s+(.+)$/iu.exec(line)
+    if (normalized !== null) {
+      result.normalized = normalized[1].trim()
+      continue
+    }
     if (/^NONE$/iu.test(line)) return {}
   }
-  return {}
+  if (Object.keys(reflection).length > 0) result.reflection = reflection
+  return result
 }

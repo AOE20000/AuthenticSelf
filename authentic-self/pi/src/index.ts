@@ -395,15 +395,41 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       return '没能在锚点里对上号，申请没有提交。'
     }
 
-    const id = store.addChange({ kind: 'revise', anchorId: target.id, newText: intent.newText, reason })
-    if (id === undefined) return '申请不合规（新文本为空或超过 120 字），没有提交。'
+    // 闸门的判定线由旁路给（A7：不写死静态阈值），代码只映射后果：
+    //   routine → 标准化后由代码直接落库（§7.5 的"静默生效"）
+    //   major   → 冷却 + 待确认（§7.4）
+    const risk = intent.risk ?? 'major'
+    const cooldown = Number(process.env.AS_CHANGE_COOLDOWN_MIN ?? 10) * 60_000
+    const applyAt = risk === 'major' ? Date.now() + cooldown : 0
+    const id = store.addChange({
+      kind: 'revise',
+      anchorId: target.id,
+      newText: intent.newText,
+      reason,
+      risk,
+      reflection: intent.reflection,
+      normalized: intent.normalized,
+      applyAt,
+    })
+    if (id === undefined) return '这条改动没能记下（新文本为空或超过 120 字）。'
+
+    if (risk === 'routine') {
+      const applied = store.decideChange(id, 'approve', 'maintenance')
+      state.pendingAudit.push({
+        type: 'custom',
+        customType: 'as/change',
+        data: { id, risk, mode: 'auto', applied, normalized: intent.normalized ?? '' },
+      })
+      return applied ? '好，按这个设定调整了。' : '这条改动没能应用。'
+    }
 
     state.pendingAudit.push({
       type: 'custom',
       customType: 'as/change',
-      data: { id, anchorId: target.id, status: 'pending' },
+      data: { id, risk, mode: 'gated', applyAt, normalized: intent.normalized ?? '' },
     })
-    return `已提交，等你批准（${id}）。当前锚点：「${target.text}」→ 想改成「${intent.newText}」。`
+    // 回执保持中性：主 AI 不该知道审批机制存在（A5 / A10）
+    return '记下了，稍后生效。'
   }
 
   pi.registerTool({
@@ -423,17 +449,28 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   })
 
   pi.registerCommand('as-pending', {
-    description: '看待批的大改申请（只看锚点与理由，不看对话原文）',
+    description: '看待批的大改申请（只看锚点与结构化反思，不看对话原文）',
     handler: async (_args: string, ctx: unknown) => {
       const pending = store.listChanges('pending')
       if (pending.length === 0) {
         notify(ctx, '没有待批的申请。', 'info')
         return
       }
-      const lines = pending.map(item =>
-        `${item.id}｜${item.anchorId}
-  「${item.oldText}」→「${item.newText}」
-  理由：${item.reason}`)
+      const lines = pending.map(item => {
+        const wait = item.applyAt > Date.now()
+          ? `冷却中，还需 ${Math.ceil((item.applyAt - Date.now()) / 60_000)} 分钟`
+          : '可裁决'
+        const reflection = Object.entries(item.reflection)
+          .map(([key, value]) => `    ${key}: ${value}`)
+          .join('\n')
+        return [
+          `${item.id}｜${item.risk}｜${wait}`,
+          `  锚点 ${item.anchorId}：「${item.oldText}」→「${item.newText}」`,
+          `  理由：${item.reason}`,
+          reflection === '' ? '' : `  结构化反思：\n${reflection}`,
+          item.normalized === '' ? '' : `  标准化：${item.normalized}`,
+        ].filter(line => line !== '').join('\n')
+      })
       notify(ctx, [`待批 ${pending.length} 条：`, ...lines].join('\n'), 'info')
     },
   })

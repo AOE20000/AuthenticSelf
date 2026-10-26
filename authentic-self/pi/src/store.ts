@@ -144,15 +144,19 @@ CREATE TABLE IF NOT EXISTS note (
 
 -- 大改申请：模型只能提，**不能落**。落定必须有人批准（01 §7.1 / D2）。
 CREATE TABLE IF NOT EXISTS pending_change (
-  id        TEXT PRIMARY KEY,
-  kind      TEXT NOT NULL,
-  anchor_id TEXT NOT NULL,
-  old_text  TEXT NOT NULL,
-  new_text  TEXT NOT NULL,
-  reason    TEXT NOT NULL,
-  status    TEXT NOT NULL DEFAULT 'pending',
-  created   INTEGER NOT NULL,
-  decided   INTEGER
+  id         TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  anchor_id  TEXT NOT NULL,
+  old_text   TEXT NOT NULL,
+  new_text   TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  risk       TEXT NOT NULL DEFAULT 'major',
+  reflection TEXT NOT NULL DEFAULT '',
+  normalized TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT 'pending',
+  apply_at   INTEGER NOT NULL DEFAULT 0,
+  created    INTEGER NOT NULL,
+  decided    INTEGER
 );
 `
 
@@ -750,6 +754,14 @@ export class Store {
     anchorId: string
     newText: string
     reason: string
+    /** 风险分级：routine 静默生效，major 进待批 + 冷却（`01` §7.5 / A7）。 */
+    risk?: 'routine' | 'major'
+    /** 结构化反思（十条字段的机器可读版）。 */
+    reflection?: Record<string, string>
+    /** 标准化映射：原话 → 标准命令，必须留档（`01` §7.5 推论 2）。 */
+    normalized?: string
+    /** 冷却到什么时候（毫秒时间戳）；0 表示不冷却。 */
+    applyAt?: number
   }): string | undefined {
     const reason = request.reason.trim()
     const newText = request.newText.trim()
@@ -765,8 +777,23 @@ export class Store {
     this.counter += 1
     const id = `c-${Date.now().toString(36)}-${this.counter}`
     this.db
-      .prepare('INSERT INTO pending_change (id, kind, anchor_id, old_text, new_text, reason, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(id, request.kind, request.anchorId, anchor.text, newText, reason, 'pending', Date.now())
+      .prepare(`INSERT INTO pending_change
+        (id, kind, anchor_id, old_text, new_text, reason, risk, reflection, normalized, status, apply_at, created)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        id,
+        request.kind,
+        request.anchorId,
+        anchor.text,
+        newText,
+        reason,
+        request.risk ?? 'major',
+        JSON.stringify(request.reflection ?? {}),
+        request.normalized ?? '',
+        'pending',
+        request.applyAt ?? 0,
+        Date.now(),
+      )
     return id
   }
 
@@ -778,10 +805,15 @@ export class Store {
     oldText: string
     newText: string
     reason: string
+    risk: string
+    reflection: Record<string, string>
+    normalized: string
     status: string
+    applyAt: number
     created: number
   }[] {
-    const base = 'SELECT id, kind, anchor_id, old_text, new_text, reason, status, created FROM pending_change'
+    const base = `SELECT id, kind, anchor_id, old_text, new_text, reason, risk, reflection, normalized,
+      status, apply_at, created FROM pending_change`
     const rows = status === undefined
       ? this.db.prepare(`${base} ORDER BY created DESC`).all()
       : this.db.prepare(`${base} WHERE status = ? ORDER BY created DESC`).all(status)
@@ -792,7 +824,11 @@ export class Store {
       old_text: string
       new_text: string
       reason: string
+      risk: string
+      reflection: string
+      normalized: string
       status: string
+      apply_at: number
       created: number
     }[]).map(row => ({
       id: row.id,
@@ -801,28 +837,46 @@ export class Store {
       oldText: row.old_text,
       newText: row.new_text,
       reason: row.reason,
+      risk: row.risk,
+      reflection: (() => {
+        try {
+          return JSON.parse(row.reflection || '{}') as Record<string, string>
+        } catch {
+          return {}
+        }
+      })(),
+      normalized: row.normalized,
       status: row.status,
+      applyAt: Number(row.apply_at),
       created: Number(row.created),
     }))
   }
 
   /**
-   * 裁决一条申请。**只允许人做**——所以 origin 必须是 `human`。
+   * 裁决一条申请。
    *
-   * 批准 = 新锚点入账（append-only）+ 旧锚点标记被取代；撤销 = 状态改回。
+   * 谁能批：
+   * - `human`：任何级别；
+   * - `maintenance`：**仅 routine**——那是代码按标准化结果执行（`01` §7.5 的"静默生效"），
+   *   模型本身仍不能直接改身份，所以 major 一律只认人。
+   *
+   * 冷却（`01` §7.4）：`apply_at` 未到时，批准被拒并告知还要等多久。
    * @param id - 申请 id。
    * @param decision - approve / reject / revoke。
    * @param origin - 谁做的决定。
    */
   decideChange(id: string, decision: 'approve' | 'reject' | 'revoke', origin = 'human'): boolean {
-    if (origin !== 'human') return false
     const row = this.db.prepare('SELECT * FROM pending_change WHERE id = ?').get(id) as unknown as
-      | { anchor_id: string; old_text: string; new_text: string; status: string }
+      | { anchor_id: string; old_text: string; new_text: string; status: string; risk: string; apply_at: number }
       | undefined
     if (row === undefined) return false
+    // routine 允许代码按标准化结果执行（静默生效）；major 只认人
+    if (origin !== 'human' && !(origin === 'maintenance' && row.risk === 'routine')) return false
 
     if (decision === 'approve') {
       if (row.status !== 'pending') return false
+      // 冷却未到：不批，也不改状态，等它到期
+      if (Number(row.apply_at) > Date.now()) return false
       const anchor = this.db.prepare('SELECT level FROM anchor WHERE id = ?').get(row.anchor_id) as unknown as
         | { level: string }
         | undefined
@@ -832,7 +886,7 @@ export class Store {
       const newId = `a-${Date.now().toString(36)}-${this.counter}`
       this.db
         .prepare('INSERT INTO anchor (id, level, text, origin, reason, created) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(newId, anchor.level, row.new_text, 'human', `change:${id}`, Date.now())
+        .run(newId, anchor.level, row.new_text, origin, `change:${id}`, Date.now())
       this.db.prepare('UPDATE anchor SET replaced_by = ? WHERE id = ?').run(newId, row.anchor_id)
       this.db.prepare('UPDATE pending_change SET status = ?, decided = ? WHERE id = ?').run('approved', Date.now(), id)
       this.addMeta('revocable_anchor', `${id}:${newId}`)
