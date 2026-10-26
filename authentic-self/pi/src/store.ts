@@ -145,6 +145,15 @@ CREATE TABLE IF NOT EXISTS archive_pointer (
 
 CREATE INDEX IF NOT EXISTS idx_archive_ts ON archive_pointer (turn_ts);
 
+-- 下轮预取：turn 末旁路猜"下一轮可能要用哪几条"，只排优先级，不注入（01 §5.5）。
+CREATE TABLE IF NOT EXISTS prefetch (
+  turn     INTEGER NOT NULL,
+  entry_id TEXT NOT NULL,
+  rank     INTEGER NOT NULL,
+  created  INTEGER NOT NULL,
+  PRIMARY KEY (turn, entry_id)
+);
+
 -- 联想边：显式边由 link 建立，隐式边只降权不删（01 §6.3）。
 CREATE TABLE IF NOT EXISTS memory_link (
   from_id  TEXT NOT NULL,
@@ -1067,6 +1076,36 @@ export class Store {
   /** 追加一行 meta（多值场景用 `key:ts` 存）。 */
   private addMeta(key: string, value: string): void {
     this.db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(`${key}:${Date.now()}`, value)
+  }
+
+  /**
+   * 记下"下一轮可能要用"的条目。
+   * @param turn - 目标轮次（当前轮 + 1）。
+   * @param ids - 条目 id，按猜测的优先级排序。
+   */
+  setPrefetch(turn: number, ids: readonly string[]): void {
+    // 过期预取直接清掉：它只是一次性的优先级提示，留着只会越积越多
+    this.db.prepare('DELETE FROM prefetch WHERE turn < ?').run(turn)
+    if (ids.length === 0) return
+    const insert = this.db.prepare(
+      'INSERT OR REPLACE INTO prefetch (turn, entry_id, rank, created) VALUES (?, ?, ?, ?)',
+    )
+    const now = Date.now()
+    ids.forEach((id, index) => insert.run(turn, id, index, now))
+  }
+
+  /**
+   * 取某一轮的预取条目（按优先级），并顺手清掉——预取只用一次。
+   * @param turn - 轮次。
+   */
+  takePrefetch(turn: number): MemoryEntry[] {
+    const rows = this.db
+      .prepare(`SELECT m.*, t.path AS tag_path FROM prefetch p
+        JOIN memory_entry m ON m.id = p.entry_id LEFT JOIN tag t ON t.id = m.tag_id
+        WHERE p.turn = ? ORDER BY p.rank`)
+      .all(turn) as unknown as Row[]
+    this.db.prepare('DELETE FROM prefetch WHERE turn = ?').run(turn)
+    return rows.map(row => toEntry(row))
   }
 
   /**

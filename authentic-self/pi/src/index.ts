@@ -28,6 +28,7 @@ import { l0Digest, renderAnchors } from './anchors'
 import { CHANGE_RULES, INTENT_RULES, parseChange, parseIntent } from './intent'
 import { APPROVER_PROMPT, buildApproverInput, parseVerdict } from './approve'
 import { DIGEST_RULES, DOC_RULES, parseDigest, parseDocVerdict } from './digest'
+import { WRAPUP_RULES, parseWrapup } from './wrapup'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
@@ -49,6 +50,10 @@ interface State {
   injected: Set<string>
   /** 本句被实时旁路 DROP 掉的条目——它们不能在后续轮次里再回来。 */
   dropped: Set<string>
+  /** 用户这一句的原文：turn 末的收尾调用要用（它拿不到历史消息）。 */
+  lastUserText: string
+  /** 已经收尾过的 turnIndex，避免多步注入时重复收尾。 */
+  wrapupTurn: number
   /** 本句新写入库的条目，攒到 turn 末写一条审计。 */
   written: string[]
   /** 攒到 turn 末落盘的审计条目（压缩等事件无法当场追加）。 */
@@ -174,6 +179,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     rounds: 0,
     injected: new Set(),
     dropped: new Set(),
+    lastUserText: '',
+    wrapupTurn: -1,
     written: [],
     pendingAudit: [],
     pressure: 0,
@@ -816,6 +823,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       state.userTurns += 1
       if (maintEvery > 0 && state.userTurns % maintEvery === 0) state.pendingMaintenance = true
 
+      state.lastUserText = plainText(event.message)
+
       // 累计轮次：冷却的轮次维用它（§7.4）
       store.setMeta('turn_total', String(Number(store.getMeta('turn_total') ?? 0) + 1))
 
@@ -827,6 +836,80 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       const cue = readMessage(event.message)
       if (cue !== undefined) state.cue = cue
     }
+  })
+
+  /**
+   * turn 末的合并调用：**沉淀 + 判用 + 预取**一次做完。
+   *
+   * 三件事同时机（都在 turn 结束后）、都不阻塞、共享同一份上下文——
+   * 这正是"能合"的那一对（见 `01` §5.5：上行与下行不能合，但它们可以）。
+   */
+  async function runWrapup(answer: string): Promise<void> {
+    const userSaid = state.lastUserText
+    if (userSaid === '' && answer === '') return
+
+    const injected = store.pendingInjections(10)
+    const pool = store.list().filter(entry => entry.state === 'active').slice(0, 20)
+    const transcript = [
+      '【用户这一句】',
+      userSaid.slice(0, 600),
+      '',
+      '【主 AI 的回答】',
+      answer.slice(0, 1200),
+      '',
+      '【上一轮的注入（判用编号只在这份清单里有效）】',
+      injected.length > 0 ? injected.map((item, index) => `#${index + 1} ${item.text}`).join('\n') : '（无）',
+      '',
+      '【候选记忆（预取编号只在这份清单里有效）】',
+      pool.length > 0 ? pool.map((entry, index) => `#${index + 1} ${entry.text}`).join('\n') : '（无）',
+    ].join('\n')
+
+    const budget = AbortSignal.timeout(Number(process.env.AS_WRAPUP_TIMEOUT ?? 15000))
+    const text = await summarize(transcript, WRAPUP_RULES, budget)
+    if (text === undefined) return
+    const result = parseWrapup(text)
+
+    // 判用（比维护旁路每 N 轮一次更及时）
+    let used = 0
+    for (const index of result.used) {
+      const item = injected[index - 1]
+      if (item === undefined) continue
+      if (store.touch(item.id)) used += 1
+    }
+    store.clearInjections(injected.map(item => item.id))
+
+    // 预取：给下一轮排优先级，不注入
+    const prefetchIds = result.prefetch
+      .map(index => pool[index - 1]?.id)
+      .filter((id): id is string => id !== undefined)
+      .slice(0, 3)
+    const nextTurn = Number(store.getMeta('turn_total') ?? 0) + 1
+    if (prefetchIds.length > 0) store.setPrefetch(nextTurn, prefetchIds)
+
+    if (used > 0 || prefetchIds.length > 0) {
+      state.pendingAudit.push({
+        type: 'custom',
+        customType: 'as/wrapup',
+        data: { used, prefetched: prefetchIds.length, turn: nextTurn },
+      })
+    }
+  }
+
+  pi.on('turn_end', async (event) => {
+    // turn_end 在多步注入时会重复触发（每一步都可能结束一次"turn"），
+    // 所以按 turnIndex 去重：同一轮只收尾一次，否则预取与判用会累积成灾。
+    const turnIndex = Number((event as { turnIndex?: number }).turnIndex ?? -1)
+    if (turnIndex >= 0) {
+      if (state.wrapupTurn === turnIndex) return
+      state.wrapupTurn = turnIndex
+    }
+
+    const message = (event as { message?: { content?: unknown } }).message
+    const answer = Array.isArray(message?.content)
+      ? message.content.map(block => String((block as { text?: string }).text ?? '')).join('')
+      : ''
+    // 不阻塞：收尾失败只是这一轮不沉淀、不预取，不补写、不猜测（§5.1）
+    void runWrapup(answer)
   })
 
   pi.on('agent_settled', async () => {
@@ -875,17 +958,9 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const text = await summarize(transcript, MAINTENANCE_RULES, budget)
     if (text === undefined) return undefined
 
-    const { marks, tags, tagOps, remembers, relations, usages } = parseMaintenance(text)
-
-    // 用到才涨：use_count +1、last_used、salience +0.05（没用到的不动）
+    const { marks, tags, tagOps, remembers, relations } = parseMaintenance(text)
+    // 判用已挪到 turn 末的收尾调用（每轮一次，比这里每 N 轮更及时）
     let used = 0
-    for (const index of usages) {
-      const item = injected[index - 1]
-      if (item === undefined) continue
-      if (store.touch(item.id)) used += 1
-    }
-    // 判过就清账，避免同一批被反复判（判不出来的下一轮也不再纠缠）
-    store.clearInjections(injected.map(item => item.id))
 
     let marked = 0
     for (const mark of marks) {
@@ -1084,7 +1159,11 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     // 候选多取几倍：时间已不参与排序（判读者看日期自己判），池子窄了它会看不到
     // 更新但措辞不同的那条，也就无从替换。
     const exclude = new Set([...state.injected, ...state.dropped])
-    const picked = canInject ? store.recall(cue.text, perRecall * 3, exclude) : []
+    // 上一轮 turn 末预取的条目先排前面：那是同一条通道的另一半（§5.5 下行→上行）
+    const prefetched = canInject ? store.takePrefetch(Number(store.getMeta('turn_total') ?? 0)) : []
+    const recalled = canInject ? store.recall(cue.text, perRecall * 3, exclude) : []
+    const seen = new Set(prefetched.map(entry => entry.id))
+    const picked = [...prefetched, ...recalled.filter(entry => !seen.has(entry.id))]
     let slots: Slot[] = picked.map((entry, index) => ({ entry, index: index + 1, text: entry.text }))
 
     if (canInject && realtimeOn) {
