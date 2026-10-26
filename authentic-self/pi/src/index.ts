@@ -18,11 +18,14 @@
  *   AS_SEED='["..."]'   库为空时播种（仅测试用）
  */
 
+import { appendFileSync } from 'node:fs'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import { Type } from '@earendil-works/pi-ai'
 import { Store } from './store'
 import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
 import { l0Digest, renderAnchors } from './anchors'
+import { INTENT_RULES, parseIntent } from './intent'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
 import {
   applyCompression,
@@ -63,8 +66,6 @@ interface State {
   userTurns: number
   /** 攒到下一次 settle 时执行维护。 */
   pendingMaintenance: boolean
-  /** 锚点块是否已在本会话注入过（只注一次，不每轮刷）。 */
-  anchorsSent: boolean
   /** 最近一条 assistant 产出的线索文本。 */
   cue?: { text: string; kind: 'reasoning' | 'fallback' }
 }
@@ -167,6 +168,15 @@ function notify(ctx: unknown, message: string): void {
 }
 
 export default function authenticSelf(pi: ExtensionAPI): void {
+  const trace = (step: string): void => {
+    if (process.env.AS_TRACE !== '1') return
+    try {
+      appendFileSync(`${process.env.TEMP ?? '.'}/as-trace.log`, `${new Date().toISOString()} ${step}\n`)
+    } catch {
+      // 追踪失败不影响主体
+    }
+  }
+  trace('factory:start')
   const enabled = flag(process.env.AS_ENABLED)
   const maxRounds = Number(process.env.AS_MAX_ROUNDS ?? 3)
   const perRecall = Number(process.env.AS_PER_RECALL ?? 2)
@@ -207,7 +217,6 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     lastViewAt: 0,
     userTurns: 0,
     pendingMaintenance: false,
-    anchorsSent: false,
   }
 
   /** 库为空时播种。仅用于测试，正式形态应由下行旁路写入。 */
@@ -256,6 +265,88 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       notify(ctx, [`记忆库（${entries.length} 条 / ${store.tagPaths().length} 个标签，显示前 20）`, ...lines].join('\n'), 'info')
     },
   })
+
+  /**
+   * 交涉通道：主 AI 唯一能主动动记忆的入口。
+   *
+   * 旁路只解析意图，**执行在代码里**（软抑制 / 取代 / 直接调出）。
+   * 拿不准就 NONE——改记忆的代价高于不改。
+   * @param say - 主 AI 的原话。
+   * @param target - 可选的目标描述。
+   * @returns 给主 AI 看的回执。
+   */
+  async function handleMemoryIntent(say: string, target?: string): Promise<string> {
+    const query = target ?? say
+    // 交涉请求是**指代**，不是检索：用户会说"住处""那个项目"，与正文常常零重叠。
+    // 所以召回不足时，直接把活跃条目摊给旁路挑——候选量有界（≤20 条短句）。
+    let candidates = store.recall(query, 6)
+    if (candidates.length < 3) {
+      const active = store.list().filter(entry => entry.state === 'active')
+      const seen = new Set(candidates.map(entry => entry.id))
+      candidates = [...candidates, ...active.filter(entry => !seen.has(entry.id))].slice(0, 20)
+    }
+    if (candidates.length === 0) return '记忆库里没有找到相关条目，没有做任何改动。'
+
+    const listed = candidates
+      .map((entry, index) => `#${index + 1} ${entry.text}`)
+      .join('\n')
+    const budget = AbortSignal.timeout(Number(process.env.AS_INTENT_TIMEOUT ?? 12000))
+    const text = await summarize(
+      [`【请求】${say}`, target === undefined ? '' : `【指向】${target}`, '', '【候选记忆】', listed].join('\n'),
+      INTENT_RULES,
+      budget,
+    )
+    if (text === undefined) return '解析服务不可用，没有做任何改动。'
+
+    const intent = parseIntent(text)
+    const picked = intent.index === undefined ? undefined : candidates[intent.index - 1]
+    if (intent.kind === 'none' || picked === undefined) {
+      return '没能在候选里对上号，没有做任何改动。可以再说具体一点。'
+    }
+
+    let outcome = ''
+    if (intent.kind === 'forget') {
+      store.suppress(picked.id)
+      outcome = `已不再主动提起：${picked.text}`
+    } else if (intent.kind === 'revise') {
+      if (intent.text === undefined || intent.text === '') return '没给新文本，没有改动。'
+      const replacement = store.add(intent.text, { origin: 'human', salience: 0.7 })
+      store.supersede(picked.id, replacement.id)
+      outcome = `已改为「${intent.text}」（旧版保留可查）`
+    } else if (intent.kind === 'remind') {
+      outcome = `调出来了：${picked.text}`
+    } else {
+      return `${intent.kind} 暂不支持，没有做任何改动。`
+    }
+
+    state.pendingAudit.push({
+      type: 'custom',
+      customType: 'as/intent',
+      data: { kind: intent.kind, id: picked.id, say: say.slice(0, 80) },
+    })
+    if (debug) process.stderr.write(`[as] intent: ${intent.kind} ${picked.id}\n`)
+    return outcome
+  }
+
+  trace('before:registerTool')
+  if (process.env.AS_TOOL !== '0') pi.registerTool({
+    name: 'memory',
+    label: 'memory',
+    description:
+      '对长期记忆提出请求：忘记、修正、想起某条内容。用自然语言说你要什么，系统负责解析与执行。'
+      + '涉及身份或长期原则的修改请勿使用本工具。',
+    promptSnippet: 'memory — 请求忘记/修正/调出某条长期记忆',
+    parameters: Type.Object({
+      say: Type.String({ description: '自然语言描述你要对记忆做什么' }),
+      target: Type.Optional(Type.String({ description: '可选：指向哪条记忆（原话片段或主题）' })),
+    }),
+    async execute(_toolCallId: string, params: { say: string; target?: string }) {
+      const text = await handleMemoryIntent(params.say, params.target)
+      return { content: [{ type: 'text' as const, text }], details: {} }
+    },
+  })
+
+  trace('after:registerTool')
 
   /** 压缩指令：把"不能丢"的东西点名给摘要器，而不是让它自己猜。 */
   function compactInstructions(): string {
@@ -343,7 +434,37 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   // 称重：每次调用前看一眼占用。**不在这里压缩**——在 context 里调 compact 会中断当前请求。
+  /**
+   * 锚点块：走**视图注入**，不走 `agent_before_settle` 的 entries。
+   *
+   * 踩过的坑：从 settle 返回条目、且不带 `continue` 时，pi 的文本模式会吞掉
+   * 整轮输出（功能正常但不打印）。所以锚点改成在 `context` 里前置到视图。
+   * 「有没有注过」用 meta 记账，键是会话首条用户消息的时间戳——跨进程有效。
+   * @param messages - 当前发给模型的消息。
+   * @returns 前置了锚点的新数组；不需要注入时为 undefined。
+   */
+  function withAnchors(messages: readonly unknown[]): unknown[] | undefined {
+    if (hasAnchorBlock(messages)) return undefined
+    const firstUser = messages.find(message => (message as { role?: string }).role === 'user') as
+      | { timestamp?: number }
+      | undefined
+    const key = `anchor_sent:${firstUser?.timestamp ?? 0}`
+    if (store.getMeta(key) !== undefined) return undefined
+
+    const anchors = store.listAnchors()
+    store.setMeta(key, '1')
+    state.pendingAudit.push({
+      type: 'custom',
+      customType: 'as/anchor_view',
+      data: { l0: l0Digest(), l1: anchors.length, l1Ids: anchors.map(anchor => anchor.id) },
+    })
+    return [{ role: 'user', content: [{ type: 'text', text: renderAnchors(anchors) }] }, ...messages]
+  }
+
   pi.on('context', async (event, ctx) => {
+    const anchored = withAnchors(event.messages)
+    if (anchored !== undefined) return { messages: anchored as never[] }
+
     const usage = ctx.getContextUsage?.()
     if (usage === undefined || typeof usage.tokens !== 'number') return undefined
     const usable = Math.max(1, usage.contextWindow - reserve)
@@ -710,24 +831,6 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     }
 
     const contextMessages = (event.context as { contextMessages?: unknown[] } | undefined)?.contextMessages ?? []
-
-    // 锚点块：**会话内只注一次**。它是常量背景，不是检索结果，所以不走记忆通道。
-    // 判"注过没有"必须看上下文本身——内存标记活不过一次进程（每次 pi 调用都是新进程）。
-    if (!state.anchorsSent && !hasAnchorBlock(contextMessages)) {
-      state.anchorsSent = true
-      const anchors = store.listAnchors()
-      audit.push({
-        type: 'custom',
-        customType: 'as/anchor_view',
-        data: { l0: l0Digest(), l1: anchors.length, l1Ids: anchors.map(anchor => anchor.id) },
-      })
-      audit.push({
-        type: 'custom_message',
-        customType: 'as/anchor',
-        content: renderAnchors(anchors),
-        display: false,
-      })
-    }
 
     // 维护旁路：到点就跑一次（跑完才继续，因为它的结果影响同一轮的压缩判据）
     if (state.pendingMaintenance || maintenanceDue(contextMessages)) {

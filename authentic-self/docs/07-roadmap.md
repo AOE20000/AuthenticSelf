@@ -110,7 +110,7 @@ score = w_rec·recency + w_sal·salience + w_rel·重叠度
 
 ## M2 交涉通道
 
-### M2.1 `memory` 单一触发（C4 裁定）
+### M2.1 `memory` 单一触发（C4 裁定）✅ 已完成（2026-10-26）
 
 一个工具，只收自然语言 + 可选目标：
 
@@ -120,7 +120,7 @@ memory({ say: "把上周那个 Redis 的结论忘掉", target?: "Redis 缓存选
 
 `kind`（forget/revise/remind/link/unlink）由旁路解析，主 AI 不需要知道枚举。
 
-**验收**：主 AI 说"别再提 X"，下一轮真的不注入了。
+**验收**：✅ 主 AI 调 `memory({say:"把住处那条忘掉"})` → 条目转 `suppressed` → 下一轮答"我不知道"，不再注入。见 `04` 实测记录 12。
 
 ### M2.2 变更门控：delta-clamp + 观察窗
 
