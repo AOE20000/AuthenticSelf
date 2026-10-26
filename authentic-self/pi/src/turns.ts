@@ -179,23 +179,80 @@ export type DupPolicy = 'placeholder' | 'drop'
  * @param dupPolicy - 重复轮是留占位还是整轮丢弃。
  * @returns 新数组；没有任何改动时返回 undefined。
  */
+/** 取一轮的标题：首条用户消息的前 12 个字符，压成一行。 */
+function titleOf(messages: readonly unknown[], turn: Turn, textOfMessage: (message: unknown) => string): string {
+  for (const message of messages.slice(turn.start, turn.end)) {
+    const text = textOfMessage(message).replace(/\s+/gu, ' ').trim()
+    if (text !== '') return text.slice(0, 12)
+  }
+  return '（无正文）'
+}
+
+/** 日期标签：YYYY-MM-DD。 */
+function dayLabel(timestamp: number): string {
+  const date = new Date(timestamp)
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
+/** 一次压缩产出的归档指针（原文仍在会话文件里，这里只记位置）。 */
+export interface ArchiveRef {
+  turn: number
+  timestamp: number
+  title: string
+  chars: number
+}
+
+/**
+ * 把结果写回消息数组：每轮原地替换，顺序不变。
+ *
+ * 被替换的轮会留一条**索引行**（日期 + 标题 + 字数），因为"移出 ≠ 删除"——
+ * 模型得知道自己忘了什么，才有机会按时间把它找回来。
+ * @param messages - 原数组。
+ * @param turns - 本次处理的轮（通常是一批）。
+ * @param parsed - 解析结果。
+ * @param dupPolicy - 重复轮是留占位还是整轮丢弃。
+ * @returns 新数组 + 归档指针；没有任何改动时返回 undefined。
+ */
 export function applyCompression(
   messages: readonly unknown[],
   turns: readonly Turn[],
   parsed: ReadonlyMap<number, TurnResult>,
   dupPolicy: DupPolicy = 'placeholder',
-): { messages: unknown[]; changed: number; dropped: number } | undefined {
+): { messages: unknown[]; changed: number; dropped: number; archived: ArchiveRef[] } | undefined {
   const replace = new Map<number, { text: string; drop: boolean }>()
+  const archived: ArchiveRef[] = []
+  const textOfMessage = (message: unknown): string => {
+    const content = (message as { content?: unknown }).content
+    if (typeof content === 'string') return content
+    if (!Array.isArray(content)) return ''
+    return content.map(block => String((block as { text?: string }).text ?? '')).join(' ')
+  }
+
   for (const turn of turns) {
     if (turn.protected) continue
     const result = parsed.get(turn.index)
     if (result === undefined) continue
+
+    const stamp = Number((messages[turn.start] as { timestamp?: number }).timestamp ?? Date.now())
+    const title = titleOf(messages, turn, textOfMessage)
+    const chars = messages.slice(turn.start, turn.end).reduce((sum, message) => sum + textOfMessage(message).length, 0)
+    archived.push({ turn: turn.index, timestamp: stamp, title, chars })
+
+    const index = `已归档｜${dayLabel(stamp)}｜${title}`
     if (result.kind === 'text') {
-      replace.set(turn.index, { text: `【T${turn.index}】${result.text}`, drop: false })
+      replace.set(turn.index, {
+        text: `【T${turn.index}】${result.text}\n（${index}｜原文 ${chars} 字不在上下文内，可按时间检索）`,
+        drop: false,
+      })
     } else if (dupPolicy === 'drop') {
       replace.set(turn.index, { text: '', drop: true })
     } else {
-      replace.set(turn.index, { text: `【T${turn.index}·与 T${result.of} 重复，已省略】`, drop: false })
+      replace.set(turn.index, {
+        text: `【T${turn.index}·与 T${result.of} 重复】（${index}｜原文 ${chars} 字不在上下文内，可按时间检索）`,
+        drop: false,
+      })
     }
   }
   if (replace.size === 0) return undefined
@@ -214,5 +271,5 @@ export function applyCompression(
     changed += 1
   }
   out.push(...messages.slice(cursor))
-  return { messages: out, changed, dropped }
+  return { messages: out, changed, dropped, archived }
 }

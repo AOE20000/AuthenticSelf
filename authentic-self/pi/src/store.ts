@@ -118,6 +118,19 @@ CREATE TABLE IF NOT EXISTS anchor (
   reason   TEXT NOT NULL DEFAULT '',
   created  INTEGER NOT NULL
 );
+
+-- 归档指针：哪一轮被移出上下文、原文在哪个会话文件里。
+-- 「移出 ≠ 删除」——正文一直在会话存档，这张表只是索引。
+CREATE TABLE IF NOT EXISTS archive_pointer (
+  id           TEXT PRIMARY KEY,
+  session_file TEXT NOT NULL,
+  turn_ts      INTEGER NOT NULL,
+  title        TEXT NOT NULL,
+  chars        INTEGER NOT NULL DEFAULT 0,
+  created      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_ts ON archive_pointer (turn_ts);
 `
 
 export interface MemoryEntry {
@@ -657,6 +670,36 @@ export class Store {
       ? this.db.prepare(`${base} ORDER BY created`).all()
       : this.db.prepare(`${base} WHERE level = ? ORDER BY created`).all(level)
     return rows as unknown as { id: string; level: string; text: string; created: number }[]
+  }
+
+  /**
+   * 记一批归档指针（压缩时调用）。同一轮重复记会被忽略。
+   * @param refs - 被移出的轮。
+   * @param sessionFile - 原文所在的会话文件。
+   */
+  addArchiveRefs(refs: readonly { turn: number; timestamp: number; title: string; chars: number }[], sessionFile: string): void {
+    const exists = this.db.prepare('SELECT 1 FROM archive_pointer WHERE session_file = ? AND turn_ts = ?')
+    const insert = this.db.prepare(
+      'INSERT INTO archive_pointer (id, session_file, turn_ts, title, chars, created) VALUES (?, ?, ?, ?, ?, ?)',
+    )
+    for (const ref of refs) {
+      if (exists.get(sessionFile, ref.timestamp) !== undefined) continue
+      this.counter += 1
+      insert.run(`p-${Date.now().toString(36)}-${this.counter}`, sessionFile, ref.timestamp, ref.title, ref.chars, Date.now())
+    }
+  }
+
+  /** 全部归档指针，时间正序（供分阶段下钻）。 */
+  archiveRefs(limit = 500): { turnTs: number; title: string; chars: number; sessionFile: string }[] {
+    const rows = this.db
+      .prepare('SELECT turn_ts, title, chars, session_file FROM archive_pointer ORDER BY turn_ts DESC LIMIT ?')
+      .all(limit) as unknown as { turn_ts: number; title: string; chars: number; session_file: string }[]
+    return rows.map(row => ({
+      turnTs: Number(row.turn_ts),
+      title: row.title,
+      chars: Number(row.chars),
+      sessionFile: row.session_file,
+    }))
   }
 
   /** 写一个小值。 */

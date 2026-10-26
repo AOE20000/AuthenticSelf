@@ -26,6 +26,7 @@ import { choosePrompt, renderTranscript, summarize } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
 import { l0Digest, renderAnchors } from './anchors'
 import { INTENT_RULES, parseIntent } from './intent'
+import { renderArchiveView } from './archive'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
 import {
   applyCompression,
@@ -348,6 +349,13 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
   trace('after:registerTool')
 
+  pi.registerCommand('as-archive', {
+    description: '按时间分阶段检索归档（所有 → 年 → 月 → 日）',
+    handler: async (args: string, ctx: unknown) => {
+      notify(ctx, renderArchiveView(store.archiveRefs(), args ?? ''), 'info')
+    },
+  })
+
   /** 压缩指令：把"不能丢"的东西点名给摘要器，而不是让它自己猜。 */
   function compactInstructions(): string {
     const keep = store.list()
@@ -376,6 +384,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   async function compressByTurns(
     messages: readonly unknown[],
     signal: AbortSignal | undefined,
+    sessionFile = '',
   ): Promise<unknown[] | undefined> {
     const turns = segmentTurns(messages, { keepRecent, marks: store.turnMarks() })
     const candidates = turns.filter(turn => !turn.protected)
@@ -410,10 +419,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     const applied = applyCompression(messages, turns, merged, dupPolicy)
     if (applied === undefined) return undefined
+    // 记录归档指针：原文仍在会话文件里，这张表只解决"往哪找"
+    if (sessionFile !== '') store.addArchiveRefs(applied.archived, sessionFile)
     state.pendingAudit.push({
       type: 'custom',
       customType: 'as/turn_compress',
-      data: { turns: applied.changed, dropped: applied.dropped, batches },
+      data: { turns: applied.changed, dropped: applied.dropped, batches, archived: applied.archived.length },
     })
     if (debug) process.stderr.write(`[as] turn compress ${applied.changed}/${turns.length} (dropped ${applied.dropped})\n`)
     state.lastViewAt = state.pressure
@@ -473,7 +484,9 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     // 先试按轮压缩（全局视野 + 按轮写回）；不成立再退回整段纪要或确定性折叠
     if (state.pressure >= foldAt) {
-      const compressed = await compressByTurns(event.messages, ctx.signal)
+      const sessionFile = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } })
+        .sessionManager?.getSessionFile?.() ?? ''
+      const compressed = await compressByTurns(event.messages, ctx.signal, sessionFile)
       if (compressed !== undefined) return { messages: compressed }
     }
 
