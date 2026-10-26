@@ -9,12 +9,12 @@
 
 | # | 做了什么 | 证据 |
 |---|---|---|
-| ✅ | P0 注入闭环（关掉泛化、开启命中） | `03-p0-plan.md` 实测记录 1 |
+| ✅ | P0 注入闭环（关掉泛化、开启命中） | `04-implementation.md` 实测记录 1 |
 | ✅ | 下行写入（"记住 X" → 写库 → 跨进程召回） | 实测记录 2 |
 | ✅ | 相似度去重（Jaccard ≥ 0.82） | 实测记录 2 第 3 轮 |
 | ✅ | 压缩触发路径（称重 / 阈值 / 指令 / 防重入） | 实测记录 3（本体未验） |
-| ✅ | Pi 五个钩子的能力边界（`context` / `agent_before_settle` / `session_before_compact` / `SessionManager.listAll` / 预算） | `08-extension-strategy.md` |
-| ✅ | 跨平台路线（Android 本地跑 Node、不做 iOS） | `07-platform-constraint.md` |
+| ✅ | Pi 五个钩子的能力边界（`context` / `agent_before_settle` / `session_before_compact` / `SessionManager.listAll` / 预算） | `05-platform.md` |
+| ✅ | 跨平台路线（Android 本地跑 Node、不做 iOS） | `05-platform.md` |
 
 ---
 
@@ -147,7 +147,7 @@ L1 语义预警（只记录）→ L2 裁判（旁路评估）→ L3 身份机制
 
 - 分阶段下钻：`所有 → 年 → 月 → 周 → 天 → 时`，任一层命中 ≤3 条则直接给片段
 - 用户备注：挂在会话上，与时间检索**并列**运行，不注入上下文
-- **来源**：原教旨 G；备注定义见 `05-forgetting-plan.md` 3.2
+- **来源**：原教旨 G；备注定义见 `03-forgetting.md` 3.2
 
 **验收**：能问"去年三月有什么"，返回月份级列表；问"那条关于缓存的"，能靠备注命中。
 
@@ -172,6 +172,17 @@ L1 语义预警（只记录）→ L2 裁判（旁路评估）→ L3 身份机制
 - **风险**：Aether 用的 Pi 版本（README 写 0.85.1，钩子在 1.x 才齐）
 
 ## 待办（已记下，暂不做）
+
+### 启用 dsh 前端作为控制台与运行记录
+
+dsh 前端已封存于 `tag frontend-frozen-2026-10-25`（`apps/` 与 `packages/`）。它的用途不是聊天界面，而是：
+
+- **Console**：标签树可视化、记忆库浏览（含状态与被取代指针）、当前注入视图、压缩前后的对照
+- **运行记录**：每次旁路决策（`as/realtime` / `as/maint` / `as/turn_compress`）的时间线，可按会话回放
+
+数据面已经齐了——审计条目都在会话存档里（`customType: as/*`），库里有 `memory_entry` / `tag` / `turn_mark` / `injection_log`。缺的是一层只读的展示。
+
+先记着。等 Aether 宿主验证过、压缩与旁路策略稳定之后再动——现在做会跟着改。
 
 ### Aether UI：单条 turn 的压缩前后切换
 
@@ -214,7 +225,7 @@ M0.2 ─┘
 
 ## 不做（明确排除）
 
-- iOS 本地运行（iSH 模拟代价过高，参见 `07`）
+- iOS 本地运行（iSH 模拟代价过高，参见 `05`）
 - 自建 UI（宿主已提供；前端已封存于 `tag frontend-frozen-2026-10-25`）
 - 本地大模型推理（我们只调 API）
 - 设备自动化（不操作手机）

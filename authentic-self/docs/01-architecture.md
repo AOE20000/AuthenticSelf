@@ -2,7 +2,7 @@
 
 > 依据：`AuthenticSelf.txt`（更新版，含两份最终设计文档）+ 2026-10-24 的 20 项决策问答。  
 > 宿主：`pi`（`pi-ai` / `pi-agent-core` / `pi-tui` / `pi-coding-agent`）。  
-> **2026-10-24 起不再以 dsh 为基座**；本文中带 ⚠️ 的小节是 dsh 时代的实现记录，只作历史参考，实际落法以 `05-forgetting-plan.md` 与 `04-pi-migration-audit.md` 为准。
+> **2026-10-24 起不再以 dsh 为基座**；本文中带 ⚠️ 的小节是 dsh 时代的实现记录，只作历史参考，实际落法以 `03-forgetting.md` 与 `archive/pi-migration-audit.md` 为准。
 > 状态：待评审。**本文档与原始表述冲突时，以原始表述为准。**
 
 ---
@@ -115,7 +115,7 @@
 > **实现状态（2026-10-26）**：下面的形状是**目标态**，不是现状。已实现：
 > `id / kind / text / span / source.origin / source.trust / sessionId / t.start / salience / confidence / state / supersededBy(replaced_by) / pinned / tag`。
 > 未实现（代码里没有对应列）：`summary`、`links`、`lastUsedAt`、`t.end`、`source.seq`、`correctedBy`（只有单向 `replaced_by`）。
-> `useCount` 列存在但**从不自增**——反馈器未接（见 `12-completeness.md` A5）。
+> `useCount` 列存在但**从不自增**——反馈器未接（见 `08-completeness.md` A5）。
 
 ```ts
 interface MemoryEntry {
@@ -475,7 +475,7 @@ L0 不进存储是关键：一旦它可被写入，任何"只读"承诺都只是
 
 ## 9. 遗忘与归档
 
-> **本节只保留意图；可执行方案以 [`05-forgetting-plan.md`](05-forgetting-plan.md) 为准。**
+> **本节只保留意图；可执行方案以 [`03-forgetting.md`](03-forgetting.md) 为准。**
 > 差异有两处：①本节把目标写成"不溢出"，而实际手段是"对旧上下文逐项调整"，因此操作集是 7 种而非 4 种；②归档的定义是"会话上下文本身，归档库就是所有会话"，没有第二份副本。
 
 ### 9.1 上下文内的遗忘
@@ -557,7 +557,7 @@ all/2026/03/w10/12/14 → 具体片段
 
 ## 12. 数据表
 
-> **与前文的差异（换基座后需要补）**：下表仍缺三样东西——`pinned` 标记（`05` 的不可移出判据）、会话表（归档库的物理载体，pi 不提供）、备注表（用户在会话上写的注脚）。`unreviewed` 按裁定**不落表**，它是压缩时的临时标记。
+> **与前文的差异（换基座后需要补）**：下表仍缺三样东西——`pinned` 标记（`03` 的不可移出判据）、会话表（归档库的物理载体，pi 不提供）、备注表（用户在会话上写的注脚）。`unreviewed` 按裁定**不落表**，它是压缩时的临时标记。
 
 ```sql
 -- 记忆
