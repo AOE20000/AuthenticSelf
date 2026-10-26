@@ -27,6 +27,7 @@ import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } 
 import { l0Digest, renderAnchors } from './anchors'
 import { INTENT_RULES, parseIntent } from './intent'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
+import { dateLabel, render } from './inject'
 import { parseRealtime, REALTIME_RULES, renderCandidates } from './realtime'
 import {
   applyCompression,
@@ -114,11 +115,6 @@ function readMessage(message: unknown): { text: string; kind: 'reasoning' | 'fal
   return text.length > 0 ? { text, kind: 'fallback' } : undefined
 }
 
-/** 把时间戳渲染成日期标签。 */
-function dateLabel(ms: number): string {
-  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString().slice(0, 10) : '时间未知'
-}
-
 /**
  * 从用户发言里抽"明确要记住"的内容。
  *
@@ -140,22 +136,6 @@ function extractExplicit(text: string): string[] {
     }
   }
   return out
-}
-
-/**
- * 渲染注入片段。
- *
- * 第 2 轮起措辞不同：若仍用"说明修正"的说法，模型会把补充当成新问题单独作答，
- * 把前文丢掉——这一点在 dsh 上实测踩过，pi 上沿用同一套约束。
- */
-function render(entries: readonly { text: string; origin: string; confidence: number; tStart: number }[], round: number): string {
-  const lines = entries.map(entry =>
-    `[记忆｜${dateLabel(entry.tStart)}｜来源:${entry.origin}｜置信:${entry.confidence >= 0.7 ? '高' : '中'}] ${entry.text}`)
-  const instruction = round === 1
-    ? '若它补充或修正了你刚才的回答，用一两句话说明修正即可；若与当前任务无关，直接忽略，不要复述或评论这些记忆本身。'
-    : '这些是对同一问题的追加补充。请把它们并入你已有的回答，必要时重述完整结论；不要把这些记忆当成新的提问。'
-  return '以下是系统从长期记忆中浮现的背景信息，不是你当前的直接感知，也不是用户的新请求。\n'
-    + `${instruction}\n\n${lines.join('\n')}`
 }
 
 /** print / json 模式下没有 UI，通知要能静默失败。 */
@@ -789,7 +769,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   /** 实时旁路的工作槽：候选条目 + 编号 + 可能被重写后的文本。 */
-  type Slot = { entry: { id: string; text: string; origin: string; confidence: number; tStart: number; tag?: string }; index: number; text: string }
+  type Slot = { entry: { id: string; text: string; origin: string; confidence: number; tStart: number; tag?: string; span?: string }; index: number; text: string }
 
   /**
    * 实时旁路：一次调用统一三件事——注入决策（DROP/REWRITE）、冲突合并、写入。
@@ -946,6 +926,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
             ids: finalPicked.map(entry => entry.id),
             cue: cue.kind,
             outcome: event.outcome,
+            // 长条目没做旁路裁决，统一降级为节选——把降级记进审计
+            degraded: finalPicked.filter(entry => entry.span === 'long' && entry.text.length > 240).map(entry => entry.id),
           },
         },
         // 真正递给模型的注入
