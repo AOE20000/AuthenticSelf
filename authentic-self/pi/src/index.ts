@@ -30,6 +30,7 @@ import { APPROVER_PROMPT, buildApproverInput, parseVerdict } from './approve'
 import { DIGEST_RULES, DOC_RULES, parseDigest, parseDocVerdict } from './digest'
 import { WRAPUP_RULES, parseWrapup } from './wrapup'
 import { PhaseGate } from './phase'
+import { looksComplex, parsePlan, PLAN_RULES } from './plan'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseMemoryBypass, MEMORY_RULES, renderCandidates } from './memory'
@@ -673,6 +674,39 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * @param messages - 当前发给模型的消息。
    * @returns 前置了锚点的新数组；不需要注入时为 undefined。
    */
+  /** 计划块的标记，用来在视图里原地替换而不是越堆越多。 */
+  const PLAN_MARK = '【当前计划】'
+
+  /**
+   * 计划区注入：**视图级原地替换**。
+   *
+   * 计划会变（步骤完成），所以不能像锚点那样"一个会话只发一次"；
+   * 但也不能每次追加一块——那会越堆越多。做法是找到上一次注入的那条，
+   * 原地换掉它（存档不动，只改发给模型的那一份）。
+   * @param messages - 当前视图消息。
+   * @param plan - 当前计划。
+   */
+  function withPlan(
+    messages: readonly unknown[],
+    plan: { goal: string; steps: string[]; openQuestions: string } | undefined,
+  ): unknown[] | undefined {
+    if (plan === undefined || plan.steps.length === 0) return undefined
+    const done = plan.steps.filter(step => step.startsWith('✓')).length
+    const lines = [
+      `${PLAN_MARK}（${done}/${plan.steps.length} 步）`,
+      `目标：${plan.goal}`,
+      ...plan.steps.map((step, index) => `  ${index + 1}. ${step}`),
+    ]
+    if (plan.openQuestions !== '') lines.push(`开放问题：${plan.openQuestions}`)
+    const block = { role: 'user', content: [{ type: 'text', text: lines.join('\n') }] }
+
+    const index = messages.findIndex(message => JSON.stringify(message).includes(PLAN_MARK))
+    if (index < 0) return [block, ...messages]
+    const copy = [...messages]
+    copy[index] = block
+    return copy
+  }
+
   function withAnchors(messages: readonly unknown[]): unknown[] | undefined {
     if (hasAnchorBlock(messages)) return undefined
     const firstUser = messages.find(message => (message as { role?: string }).role === 'user') as
@@ -692,11 +726,18 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   pi.on('context', async (event, ctx) => {
-    const anchored = withAnchors(event.messages)
+    // 计划区：每次请求刷新（步骤会完成），原地替换不堆积
+    const planned = withPlan(event.messages, store.getPlan(sessionFileOf(ctx)))
+    const messagesWithPlan = planned ?? (event.messages as unknown[])
+
+    const anchored = withAnchors(messagesWithPlan)
     if (anchored !== undefined) return { messages: anchored as never[] }
 
+    const withPlanOrUndefined = (): { messages: never[] } | undefined =>
+      planned === undefined ? undefined : { messages: messagesWithPlan as never[] }
+
     const usage = ctx.getContextUsage?.()
-    if (usage === undefined || typeof usage.tokens !== 'number') return undefined
+    if (usage === undefined || typeof usage.tokens !== 'number') return withPlanOrUndefined()
     const usable = Math.max(1, usage.contextWindow - reserve)
     state.pressure = usage.tokens / usable
     state.tokens = usage.tokens
@@ -705,15 +746,15 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     if (state.pressure >= foldAt) {
       const sessionFile = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } })
         .sessionManager?.getSessionFile?.() ?? ''
-      const compressed = await compressByTurns(event.messages, ctx.signal, sessionFile)
+      const compressed = await compressByTurns(messagesWithPlan, ctx.signal, sessionFile)
       if (compressed !== undefined) return { messages: compressed }
     }
 
     // 单 turn 内膨胀时，pi 的压缩动不了（它按 turn 边界切，切不出东西）。
     // 这里由我们自己压：先让旁路模型把较早的部分写成「按轮纪要」，
     // 失败则退回确定性折叠（只留一行索引）。两者都只改发给模型的那一份。
-    if (state.pressure < foldAt) return undefined
-    const messages = event.messages
+    if (state.pressure < foldAt) return withPlanOrUndefined()
+    const messages = messagesWithPlan
     const roleOf = (index: number): string | undefined => (messages[index] as { role?: string }).role
     const toolIndexes = messages
       .map((message, index) => (message as { role?: string }).role === 'toolResult' ? index : -1)
@@ -1137,7 +1178,10 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       }
     }
 
+    // 计划不在这里登记：它在 settle 里独立处理（这里既没有 ctx 也没有 audit，
+    // 之前误插进来过，运行时抛 ReferenceError 把整条阻塞相打断了）
     const { drops, rewrites, usages } = parseMemoryBypass(text)
+
     // 阶段一只读：即使模型误输出 REMEMBER，也不在这里写（写入归阶段二）
     const remembered = 0
 
@@ -1192,7 +1236,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     return total - last >= maintEvery
   }
 
-  pi.on('agent_before_settle', async (event) => {
+  pi.on('agent_before_settle', async (event, ctx) => {
     // 本轮写入与压缩的审计：不管有没有注入，都要留痕
     const audit: unknown[] = [...state.pendingAudit]
     state.pendingAudit = []
@@ -1254,6 +1298,41 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     } else if (canInject) {
       // 显式关闭实时旁路 = 显式关闭注入（没有直注可退）
       slots = []
+    }
+
+    // 计划区（03 §1 / source §5.3）：复杂请求必须先有计划。
+    // 与注入决策分开：实测注入旁路在没有候选时会返回"（无输出）"，把计划并进去会一起丢。
+    const planFile = sessionFileOf(ctx)
+    // cue 可能为空（模型没吐思考）；退回本轮最后一条用户消息
+    const lastUserText = [...contextMessages].reverse()
+      .flatMap(message => (message as { role?: string }).role === 'user'
+        ? [(message as { content?: unknown }).content]
+        : [])
+      .map(content => typeof content === 'string'
+        ? content
+        : Array.isArray(content)
+          ? content.map(block => String((block as { text?: string }).text ?? '')).join('')
+          : '')
+      .find(text => text !== '') ?? ''
+    const planSeed = (cue?.text ?? '') + '\n' + lastUserText
+    if (debug) process.stderr.write(`[as] plan: rounds=${state.rounds} seedLen=${planSeed.length} complex=${looksComplex(planSeed)}\n`)
+    if (state.rounds === 0 && store.getPlan(planFile) === undefined && looksComplex(planSeed)) {
+      const admission = gate.require('判用')
+      if (admission.ok) {
+        const budget = AbortSignal.timeout(Number(process.env.AS_PLAN_TIMEOUT ?? 15000))
+        const decided = await summarize(planSeed.slice(0, 1200), PLAN_RULES, budget)
+        const plan = decided === undefined ? undefined : parsePlan(decided)
+        if (plan !== undefined && store.savePlan(planFile, plan.goal, plan.steps, plan.openQuestions)) {
+          audit.push({
+            type: 'custom',
+            customType: 'as/plan',
+            data: { action: 'created', goal: plan.goal, steps: plan.steps.length },
+          })
+          if (debug) process.stderr.write(`[as] plan: 立计划「${plan.goal}」${plan.steps.length} 步\n`)
+        } else if (debug) {
+          process.stderr.write(`[as] plan: 预筛通过但未立计划（${decided === undefined ? '旁路不可用' : decided.slice(0, 40)}）\n`)
+        }
+      }
     }
 
     const basePicked = slots.slice(0, perRecall).map(slot => ({ ...slot.entry, text: slot.text }))

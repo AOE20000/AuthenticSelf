@@ -39,7 +39,15 @@ export const MEMORY_RULES = [
   '- 单条候选过时但有沿革可讲（「以前 X，现在 Y」），也用 REWRITE，不要直接丢',
   '- 与本轮思考无关的重写没有必要，不要为了改而改',
   '',
-  '**这一阶段只读不写**：不新增记忆、不改记忆状态。写入在 turn 结束后的阶段二进行。',
+  '**这一阶段不改记忆库**（不新增条目、不改记忆状态）；注入裁决与计划登记除外。',
+  '',
+  '复杂请求（多个目标/阶段、可能超预算、需要外部信息）**必须先立计划**再执行（source §5.3）：',
+  '   PLAN <一句话目标> || <步骤1>；<步骤2>；<步骤3>',
+  '   - 步骤 2–5 条，每条一句话、可验证；别写"继续优化"这种无法判断完成的话',
+  '   - 简单请求不要立计划（一句话就能答完的不配拥有计划）',
+  'DONE <步骤序号>            ← 某一步做完了，标它',
+  '',
+  '**这一阶段不写记忆内容**：新记忆的沉淀在 turn 结束后进行。',
   '',
   '顺带判用：上一轮注入的记忆，在上一次回答里**真的被用到**了哪几条？',
   '   USED <编号>          ← 编号指向「上轮注入」清单',
@@ -88,6 +96,8 @@ export function parseMemoryBypass(output: string): MemoryBypassResult {
   const rewrites = new Map<number, string>()
   const remembers: MemoryBypassResult['remembers'] = []
   const usages: number[] = []
+  const plans: RealtimeResult['plans'] = []
+  const dones: number[] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
     if (line === '') continue
@@ -100,6 +110,17 @@ export function parseMemoryBypass(output: string): MemoryBypassResult {
     if (rewrite !== null) {
       const text = rewrite[2].trim()
       if (text !== '') rewrites.set(Number(rewrite[1]), text)
+      continue
+    }
+    const plan = /^PLAN\s+(.+?)\s*\|\|\s*(.+)$/iu.exec(line)
+    if (plan !== null) {
+      const steps = plan[2].split(/[;；]/u).map(step => step.trim()).filter(step => step !== '')
+      if (plan[1].trim() !== '' && steps.length > 0) plans.push({ goal: plan[1].trim(), steps })
+      continue
+    }
+    const done = /^DONE\s+#?(\d+)$/iu.exec(line)
+    if (done !== null) {
+      dones.push(Number(done[1]))
       continue
     }
     const used = /^USED\s+(.+)$/iu.exec(line)
@@ -117,5 +138,5 @@ export function parseMemoryBypass(output: string): MemoryBypassResult {
       }
     }
   }
-  return { drops, rewrites, remembers, usages }
+  return { drops, rewrites, remembers, usages, plans, dones }
 }

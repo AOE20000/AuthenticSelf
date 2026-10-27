@@ -154,6 +154,18 @@ CREATE TABLE IF NOT EXISTS prefetch (
   PRIMARY KEY (turn, entry_id)
 );
 
+-- 计划区（03 §1）：只存摘要与步骤状态，详细计划在外部计划板。
+-- 一个会话一份当前计划；换计划覆盖旧的（历史留在审计里）。
+CREATE TABLE IF NOT EXISTS plan (
+  session_file TEXT PRIMARY KEY,
+  goal         TEXT NOT NULL,
+  steps        TEXT NOT NULL DEFAULT '[]',
+  open_q       TEXT NOT NULL DEFAULT '',
+  state        TEXT NOT NULL DEFAULT 'active',
+  created      INTEGER NOT NULL,
+  updated      INTEGER NOT NULL
+);
+
 -- 联想边：显式边由 link 建立，隐式边只降权不删（01 §6.3）。
 CREATE TABLE IF NOT EXISTS memory_link (
   from_id  TEXT NOT NULL,
@@ -1106,6 +1118,64 @@ export class Store {
       .all(turn) as unknown as Row[]
     this.db.prepare('DELETE FROM prefetch WHERE turn = ?').run(turn)
     return rows.map(row => toEntry(row))
+  }
+
+  /**
+   * 写计划（计划区）。一个会话一份，后写覆盖——但覆盖事件要进审计，
+   * 因为"计划被悄悄改掉"正是渐进施压的典型手法（source §5.3）。
+   * @param sessionFile - 会话文件。
+   * @param goal - 目标（一句话）。
+   * @param steps - 步骤清单。
+   * @param openQuestions - 开放问题。
+   * @returns 是否写入。
+   */
+  savePlan(sessionFile: string, goal: string, steps: readonly string[], openQuestions = ''): boolean {
+    const clean = goal.trim()
+    if (clean === '' || steps.length === 0) return false
+    const now = Date.now()
+    this.db
+      .prepare(`INSERT INTO plan (session_file, goal, steps, open_q, state, created, updated)
+        VALUES (?, ?, ?, ?, 'active', ?, ?)
+        ON CONFLICT(session_file) DO UPDATE SET
+          goal = excluded.goal, steps = excluded.steps, open_q = excluded.open_q,
+          state = 'active', updated = excluded.updated`)
+      .run(sessionFile, clean, JSON.stringify(steps.map(step => step.trim()).filter(step => step !== '')), openQuestions.trim(), now, now)
+    return true
+  }
+
+  /**
+   * 读当前计划。
+   * @param sessionFile - 会话文件。
+   */
+  getPlan(sessionFile: string): { goal: string; steps: string[]; openQuestions: string; state: string } | undefined {
+    const row = this.db.prepare('SELECT goal, steps, open_q, state FROM plan WHERE session_file = ?')
+      .get(sessionFile) as unknown as { goal: string; steps: string; open_q: string; state: string } | undefined
+    if (row === undefined) return undefined
+    let steps: string[] = []
+    try {
+      steps = JSON.parse(row.steps) as string[]
+    } catch {
+      steps = []
+    }
+    return { goal: row.goal, steps, openQuestions: row.open_q, state: row.state }
+  }
+
+  /**
+   * 标记某一步完成（计划区的步骤状态）。
+   * @param sessionFile - 会话文件。
+   * @param index - 步骤序号（从 1 开始）。
+   * @returns 是否命中。
+   */
+  completeStep(sessionFile: string, index: number): boolean {
+    const plan = this.getPlan(sessionFile)
+    if (plan === undefined || index < 1 || index > plan.steps.length) return false
+    const steps = [...plan.steps]
+    const current = steps[index - 1]
+    if (current === undefined || current.startsWith('✓')) return false
+    steps[index - 1] = `✓ ${current}`
+    this.db.prepare('UPDATE plan SET steps = ?, updated = ? WHERE session_file = ?')
+      .run(JSON.stringify(steps), Date.now(), sessionFile)
+    return true
   }
 
   /**
