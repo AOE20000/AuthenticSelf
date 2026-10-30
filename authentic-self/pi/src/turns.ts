@@ -198,6 +198,8 @@ function dayLabel(timestamp: number): string {
 
 /** 一次压缩产出的归档指针（原文仍在会话文件里，这里只记位置）。 */
 export interface ArchiveRef {
+  /** 这一轮的情景摘要：R2「按线索取回情景摘要」靠它（`03` §3）。 */
+  summary?: string
   turn: number
   timestamp: number
   title: string
@@ -238,7 +240,7 @@ export function applyCompression(
     const stamp = Number((messages[turn.start] as { timestamp?: number }).timestamp ?? Date.now())
     const title = titleOf(messages, turn, textOfMessage)
     const chars = messages.slice(turn.start, turn.end).reduce((sum, message) => sum + textOfMessage(message).length, 0)
-    archived.push({ turn: turn.index, timestamp: stamp, title, chars })
+    archived.push({ turn: turn.index, timestamp: stamp, title, chars, summary: result.text })
 
     const index = `已归档｜${dayLabel(stamp)}｜${title}`
     if (result.kind === 'text') {

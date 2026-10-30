@@ -553,20 +553,53 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     name: 'archive',
     label: 'archive',
     description:
-      '查看被移出上下文的归档。检索是分阶段的：不给 key 返回"哪几年有结果"，'
+      '查看被移出上下文的归档。两种查法：给 q 按内容找情景摘要（先轻后重）；'
+      + '按时间则是分阶段的：不给 key 返回"哪几年有结果"，'
       + '给 2026 返回月份，给 2026-10 返回周，给 2026-W44 返回天，给 2026-10-26 返回时，'
       + '给 2026-10-26T14 才给片段；命中过少时会直接给片段。',
     parameters: Type.Object({
       key: Type.Optional(Type.String({ description: '时间粒度：2026 / 2026-10 / 2026-W44 / 2026-10-26 / 2026-10-26T14' })),
+      q: Type.Optional(Type.String({ description: '线索（人话）：按内容找回情景摘要，比如"缓存那次讨论"' })),
     }),
-    async execute(_toolCallId: string, params: { key?: string }) {
+    async execute(_toolCallId: string, params: { key?: string; q?: string }) {
+      const admission = gate.require('归档')
+      if (!admission.ok) {
+        return { content: [{ type: 'text' as const, text: '现在不查归档，等这一轮结束后再说。' }], details: {} }
+      }
       const refs = store.archiveRefs()
       // 只读也要留痕：事后能看出模型查了什么（D2 修订里的三条约束之一）
       state.pendingAudit.push({
         type: 'custom',
         customType: 'as/archive_query',
-        data: { key: params.key ?? '', refs: refs.length },
+        data: { key: params.key ?? '', q: params.q ?? '', refs: refs.length },
       })
+
+      // R2：按线索取回情景摘要（细节模糊但索引在时走这一级）
+      if (params.q !== undefined && params.q.trim() !== '') {
+        const hits = store.searchArchive(params.q, 3)
+        if (hits.length === 0) {
+          // 先澄清后猜测（03 §3 的原则）：问时间/人名/关键词，而不是硬猜一段
+          return {
+            content: [{
+              type: 'text' as const,
+              text: '没找到沾边的摘要。给我更具体的线索（大概哪段时间、跟谁或哪个项目有关、说过什么词），我再查一次；也可能这段当时没留下摘要。',
+            }],
+            details: {},
+          }
+        }
+        const lines = hits.map(hit => {
+          const when = new Date(hit.turnTs).toISOString().slice(0, 16).replace('T', ' ')
+          return `[${when}] ${hit.title}\n  ${hit.summary.slice(0, 300)}`
+        })
+        return {
+          content: [{
+            type: 'text' as const,
+            text: ['这是摘要，不是原话：', ...lines, '', '要某一条的原文，用时间粒度（key）下钻到那一段。'].join('\n'),
+          }],
+          details: {},
+        }
+      }
+
       const text = await renderArchiveView(
         refs,
         params.key ?? '',

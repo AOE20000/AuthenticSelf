@@ -315,6 +315,10 @@ export class Store {
     if (!columns.some(column => column.name === 'last_used')) {
       this.db.exec('ALTER TABLE memory_entry ADD COLUMN last_used INTEGER')
     }
+    const archiveColumns = this.db.prepare('PRAGMA table_info(archive_pointer)').all() as unknown as { name: string }[]
+    if (!archiveColumns.some(column => column.name === 'summary')) {
+      this.db.exec("ALTER TABLE archive_pointer ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+    }
     const docColumns = this.db.prepare('PRAGMA table_info(memory_entry)').all() as unknown as { name: string }[]
     if (!docColumns.some(column => column.name === 'doc_verdict')) {
       this.db.exec("ALTER TABLE memory_entry ADD COLUMN doc_verdict TEXT NOT NULL DEFAULT ''")
@@ -1183,15 +1187,26 @@ export class Store {
    * @param refs - 被移出的轮。
    * @param sessionFile - 原文所在的会话文件。
    */
-  addArchiveRefs(refs: readonly { turn: number; timestamp: number; title: string; chars: number }[], sessionFile: string): void {
+  addArchiveRefs(
+    refs: readonly { turn: number; timestamp: number; title: string; chars: number; summary?: string }[],
+    sessionFile: string,
+  ): void {
     const exists = this.db.prepare('SELECT 1 FROM archive_pointer WHERE session_file = ? AND turn_ts = ?')
     const insert = this.db.prepare(
-      'INSERT INTO archive_pointer (id, session_file, turn_ts, title, chars, created) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT INTO archive_pointer (id, session_file, turn_ts, title, chars, summary, created) VALUES (?, ?, ?, ?, ?, ?, ?)',
     )
     for (const ref of refs) {
       if (exists.get(sessionFile, ref.timestamp) !== undefined) continue
       this.counter += 1
-      insert.run(`p-${Date.now().toString(36)}-${this.counter}`, sessionFile, ref.timestamp, ref.title, ref.chars, Date.now())
+      insert.run(
+        `p-${Date.now().toString(36)}-${this.counter}`,
+        sessionFile,
+        ref.timestamp,
+        ref.title,
+        ref.chars,
+        ref.summary ?? '',
+        Date.now(),
+      )
     }
   }
 
@@ -1206,6 +1221,48 @@ export class Store {
       chars: Number(row.chars),
       sessionFile: row.session_file,
     }))
+  }
+
+  /**
+   * R2：按线索取回**情景摘要**（`03` §3——细节模糊但索引在时走这一级）。
+   *
+   * 打分只看字面重叠，因为这一级要的是"哪几轮沾边"；判断"够不够"是主 AI 的事。
+   * @param cue - 线索（自然语言）。
+   * @param limit - 最多几条。
+   */
+  searchArchive(cue: string, limit = 3): { turnTs: number; title: string; summary: string; sessionFile: string; score: number }[] {
+    // 中文没有空格：拉丁词按空格切，CJK 用二元组（与召回同一套口径）
+    const lower = cue.toLowerCase()
+    const words = [
+      ...lower.split(/[^\p{Script=Han}\p{L}\p{N}]+/u).filter(word => word.length >= 2),
+      ...(() => {
+        const han = lower.replace(/[^\p{Script=Han}]+/gu, ' ')
+        const grams: string[] = []
+        for (const run of han.split(' ')) {
+          for (let index = 0; index + 2 <= run.length; index += 1) grams.push(run.slice(index, index + 2))
+        }
+        return grams
+      })(),
+    ]
+    const rows = this.db
+      .prepare("SELECT turn_ts, title, summary, session_file FROM archive_pointer WHERE summary <> '' ORDER BY turn_ts DESC LIMIT 500")
+      .all() as unknown as { turn_ts: number; title: string; summary: string; session_file: string }[]
+    return rows
+      .map(row => {
+        const haystack = `${row.title}\n${row.summary}`.toLowerCase()
+        let score = 0
+        for (const word of words) if (haystack.includes(word)) score += 1
+        return {
+          turnTs: Number(row.turn_ts),
+          title: row.title,
+          summary: row.summary,
+          sessionFile: row.session_file,
+          score,
+        }
+      })
+      .filter(item => item.score > 0)
+      .sort((left, right) => right.score - left.score || right.turnTs - left.turnTs)
+      .slice(0, limit)
   }
 
   /**
