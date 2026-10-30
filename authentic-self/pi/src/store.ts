@@ -154,6 +154,17 @@ CREATE TABLE IF NOT EXISTS prefetch (
   PRIMARY KEY (turn, entry_id)
 );
 
+-- 剔除清单（02 B6-a）：发送视图 = 存档 + 清单；存档一个字节都不动。
+CREATE TABLE IF NOT EXISTS redaction (
+  id           TEXT PRIMARY KEY,
+  session_file TEXT NOT NULL DEFAULT '',
+  find_text    TEXT NOT NULL,
+  replace_text TEXT NOT NULL DEFAULT '……',
+  reason       TEXT NOT NULL DEFAULT '',
+  turn         INTEGER NOT NULL DEFAULT 0,
+  created      INTEGER NOT NULL
+);
+
 -- 计划区（03 §1）：只存摘要与步骤状态，详细计划在外部计划板。
 -- 一个会话一份当前计划；换计划覆盖旧的（历史留在审计里）。
 CREATE TABLE IF NOT EXISTS plan (
@@ -1221,6 +1232,57 @@ export class Store {
       chars: Number(row.chars),
       sessionFile: row.session_file,
     }))
+  }
+
+  /**
+   * 记一条剔除（`02` B6-a）。**只登记，不改存档**。
+   * @param find - 要遮蔽的原文片段。
+   * @param reason - 为什么（审计要能解释）。
+   * @param options.sessionFile - 会话文件；省略表示所有会话。
+   * @param options.replace - 替换成什么（默认「……」）。
+   * @returns 是否登记（空片段不登）。
+   */
+  addRedaction(
+    find: string,
+    reason: string,
+    options: { sessionFile?: string; replace?: string; turn?: number } = {},
+  ): string | undefined {
+    const needle = find.trim()
+    // 太短的片段会误伤正常文本（三个字以下不许当剔除规则）
+    if (needle.length < 4) return undefined
+    this.counter += 1
+    const id = `r-${Date.now().toString(36)}-${this.counter}`
+    this.db
+      .prepare(`INSERT INTO redaction (id, session_file, find_text, replace_text, reason, turn, created)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(id, options.sessionFile ?? '', needle, options.replace ?? '……', reason.trim().slice(0, 200), options.turn ?? 0, Date.now())
+    return id
+  }
+
+  /** 剔除清单（发送视图靠它现算）。 */
+  redactions(sessionFile: string): { id: string; find: string; replace: string; reason: string }[] {
+    const rows = this.db
+      .prepare("SELECT id, find_text, replace_text, reason FROM redaction WHERE session_file = '' OR session_file = ? ORDER BY created")
+      .all(sessionFile) as unknown as { id: string; find_text: string; replace_text: string; reason: string }[]
+    return rows.map(row => ({ id: row.id, find: row.find_text, replace: row.replace_text, reason: row.reason }))
+  }
+
+  /**
+   * 作废派生自某段内容的沉淀（`02` B6-a 第 4 条）。
+   *
+   * 只动**同一轮内写下、且包含该片段**的条目——视图改不了已经落库的输出，
+   * 但可以让它不再被注入。
+   * @param fragment - 被剔除的片段。
+   * @param turnCreated - 只处理这个时间点之后写下的条目（毫秒）。
+   * @returns 被作废的条目数。
+   */
+  suppressDerived(fragment: string, turnCreated: number): number {
+    const needle = fragment.trim()
+    if (needle.length < 4) return 0
+    const result = this.db
+      .prepare("UPDATE memory_entry SET state = 'suppressed' WHERE t_start >= ? AND instr(text, ?) > 0 AND state = 'active'")
+      .run(turnCreated, needle)
+    return Number(result.changes)
   }
 
   /**

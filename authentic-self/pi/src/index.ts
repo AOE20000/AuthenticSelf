@@ -31,6 +31,7 @@ import { DIGEST_RULES, DOC_RULES, parseDigest, parseDocVerdict } from './digest'
 import { WRAPUP_RULES, parseWrapup } from './wrapup'
 import { PhaseGate } from './phase'
 import { looksComplex, parsePlan, PLAN_RULES } from './plan'
+import { applyRedactions } from './redact'
 import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch } from './archive'
 import { dateLabel, render } from './inject'
 import { parseMemoryBypass, MEMORY_RULES, renderCandidates } from './memory'
@@ -764,6 +765,18 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const messagesWithPlan = planned ?? (event.messages as unknown[])
 
     const anchored = withAnchors(messagesWithPlan)
+    const viewAfterAnchors = anchored ?? (messagesWithPlan as unknown[])
+
+    // 剔除：发送视图 = 存档 + 清单（纯函数，02 B6-a）。收藏不动，只改模型看到的那一份
+    const redacted = applyRedactions(viewAfterAnchors, store.redactions(sessionFileOf(ctx)))
+    if (redacted.hits > 0) {
+      state.pendingAudit.push({
+        type: 'custom',
+        customType: 'as/redaction_view',
+        data: { hits: redacted.hits },
+      })
+      return { messages: redacted.messages as never[] }
+    }
     if (anchored !== undefined) return { messages: anchored as never[] }
 
     const withPlanOrUndefined = (): { messages: never[] } | undefined =>
@@ -1213,7 +1226,22 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     // 计划不在这里登记：它在 settle 里独立处理（这里既没有 ctx 也没有 audit，
     // 之前误插进来过，运行时抛 ReferenceError 把整条阻塞相打断了）
-    const { drops, rewrites, usages } = parseMemoryBypass(text)
+    const { drops, rewrites, usages, redacts } = parseMemoryBypass(text)
+
+    for (const item of redacts) {
+      // 剔除自动执行，不挂等人工（D16）；但每一笔都要能解释
+      const id = store.addRedaction(item.find, item.reason, {
+        sessionFile: sessionFileOf(ctx),
+        turn: Number(store.getMeta('turn_total') ?? 0),
+      })
+      if (id === undefined) continue
+      const invalidated = store.suppressDerived(item.find, Date.now() - 10 * 60_000)
+      audit.push({
+        type: 'custom',
+        customType: 'as/redaction',
+        data: { id, find: item.find.slice(0, 60), reason: item.reason, invalidated },
+      })
+    }
 
     // 阶段一只读：即使模型误输出 REMEMBER，也不在这里写（写入归阶段二）
     const remembered = 0
