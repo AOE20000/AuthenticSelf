@@ -375,6 +375,21 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     return manager?.getSessionFile?.() ?? ''
   }
 
+  pi.registerCommand('as-audit', {
+    description: '查看审计链（HMAC 链）并校验完整性',
+    handler: async (_args: string, ctx: unknown) => {
+      const check = store.verifyAudit()
+      const health = check.ok
+        ? `链完整（${check.count} 条）`
+        : `⚠️ 链断裂于第 ${check.brokenAt ?? '?'} 条：${check.reason ?? '未知原因'}`
+      const rows = store.recentAudit(12).map(row => {
+        const when = new Date(row.at).toISOString().slice(5, 16).replace('T', ' ')
+        return `${String(row.seq).padStart(4)} ${when} ${row.kind.padEnd(20)} ${row.data.slice(0, 60)}`
+      })
+      notify(ctx, [`审计链：${health}`, ...rows].join('\n'), check.ok ? 'info' : 'warn')
+    },
+  })
+
   pi.registerCommand('as-archive', {
     description: '按时间分阶段检索归档；非日期参数按备注检索',
     handler: async (args: string, ctx: unknown) => {
@@ -997,6 +1012,17 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   // agent_start = 用户一轮的开始。
   // 轮次簿记放这里而不是 message_end(user)：实测 message_end 在 settle 之后才触发，
   // 用它当"轮开始"信号会让检索相被相位门拒绝（迟到一轮）。
+  pi.on('session_start', async () => {
+    const check = store.verifyAudit()
+    if (!check.ok) {
+      // 不阻断使用：链断了是"证据被动过"，不是"系统不能跑"
+      process.stderr.write(`[as] 审计链断裂于第 ${check.brokenAt ?? '?'} 条：${check.reason ?? '未知原因'}\n`)
+      store.appendAudit('as/audit_broken', { brokenAt: check.brokenAt ?? 0, reason: check.reason ?? '', count: check.count })
+      return
+    }
+    store.appendAudit('as/session_start', { auditCount: check.count, l0: l0Digest() })
+  })
+
   pi.on('agent_start', async () => {
     // 注入续步会再开一圈 agent 循环：它仍是同一轮，相位保持阻塞，不重开轮次
     if (state.continueScheduled) {
@@ -1167,6 +1193,25 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * @param current - 当前候选槽。
    * @returns 过滤后的槽 + 一条审计；旁路没给出任何决策时为 undefined。
    */
+  /**
+   * 把本轮的审计条目写进审计链（M4）。
+   *
+   * 会话里的 `custom` 条目是给人看的副本——它可改可删；链表才是"改了就断"的那份。
+   * 没有链表时，一次"悄悄改历史"只留下一个没人比对的沙盒。
+   * @param entries - 本轮收集的审计条目。
+   */
+  function chainAudit(entries: readonly unknown[]): void {
+    for (const entry of entries) {
+      const record = entry as { customType?: string; data?: unknown }
+      if (typeof record.customType !== 'string') continue
+      try {
+        store.appendAudit(record.customType, record.data ?? {})
+      } catch {
+        // 链写失败不能拖垮这一轮：审计是旁证，不是前置条件
+      }
+    }
+  }
+
   async function runMemoryBypass(
     cueText: string,
     current: Slot[],
@@ -1466,6 +1511,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     }
 
     if (finalPicked.length === 0) {
+      chainAudit(audit)
       return audit.length > 0 ? { entries: audit as never[] } : undefined
     }
 
@@ -1477,6 +1523,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const text = render(finalPicked, state.rounds)
     // 排定了续步：agent 循环会再开一圈，相位门要认得它（否则第一圈结束时就被切到非阻塞）
     state.continueScheduled = true
+    chainAudit(audit)
     return {
       entries: [
         ...audit,

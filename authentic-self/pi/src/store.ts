@@ -7,6 +7,7 @@
  * - `suppress()` 只改状态，不删正文——遗忘不是删除。
  */
 
+import { createHmac, randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -152,6 +153,16 @@ CREATE TABLE IF NOT EXISTS prefetch (
   rank     INTEGER NOT NULL,
   created  INTEGER NOT NULL,
   PRIMARY KEY (turn, entry_id)
+);
+
+-- 审计链（M4）：每条与上一条的 hash 相连，改中间一条就断链。
+CREATE TABLE IF NOT EXISTS audit_chain (
+  seq   INTEGER PRIMARY KEY AUTOINCREMENT,
+  at    INTEGER NOT NULL,
+  kind  TEXT NOT NULL,
+  data  TEXT NOT NULL,
+  prev  TEXT NOT NULL,
+  hash  TEXT NOT NULL
 );
 
 -- 剔除清单（02 B6-a）：发送视图 = 存档 + 清单；存档一个字节都不动。
@@ -1232,6 +1243,65 @@ export class Store {
       chars: Number(row.chars),
       sessionFile: row.session_file,
     }))
+  }
+
+  /**
+   * 往审计链上追加一条（M4）。
+   *
+   * `hash = H(prev + kind + data + at)`，`prev` 是上一条的 hash——改任何一条中途记录
+   * 都会让后面的链对不上。**局限要说清**：密钥与库在同一台机器上，
+   * 这防的是"悄悄改历史"，不防"有 root 权限的人重算整条链"。
+   * @param kind - 事件类型（as/injection、as/redaction…）。
+   * @param data - 结构化内容。
+   */
+  appendAudit(kind: string, data: unknown): void {
+    const last = this.db.prepare('SELECT hash FROM audit_chain ORDER BY seq DESC LIMIT 1').get() as unknown as
+      | { hash: string }
+      | undefined
+    const prev = last?.hash ?? 'genesis'
+    const at = Date.now()
+    const payload = JSON.stringify(data ?? {})
+    const hash = createHmac('sha256', this.auditKey()).update(`${prev}|${kind}|${payload}|${at}`).digest('hex')
+    this.db
+      .prepare('INSERT INTO audit_chain (at, kind, data, prev, hash) VALUES (?, ?, ?, ?, ?)')
+      .run(at, kind, payload, prev, hash)
+  }
+
+  /**
+   * 校验链完整性。
+   * @returns 断链位置与原因；完整时 `ok` 为 true。
+   */
+  verifyAudit(): { ok: boolean; brokenAt?: number; reason?: string; count: number } {
+    const rows = this.db.prepare('SELECT seq, at, kind, data, prev, hash FROM audit_chain ORDER BY seq').all() as unknown as
+      { seq: number; at: number; kind: string; data: string; prev: string; hash: string }[]
+    let prev = 'genesis'
+    for (const row of rows) {
+      const expected = createHmac('sha256', this.auditKey()).update(`${prev}|${row.kind}|${row.data}|${row.at}`).digest('hex')
+      if (row.prev !== prev) return { ok: false, brokenAt: row.seq, reason: 'prev 对不上（前一条被改过或删过）', count: rows.length }
+      if (row.hash !== expected) return { ok: false, brokenAt: row.seq, reason: '内容被改过', count: rows.length }
+      prev = row.hash
+    }
+    return { ok: true, count: rows.length }
+  }
+
+  /** 最近 n 条审计（新在前）。 */
+  recentAudit(limit = 20): { seq: number; at: number; kind: string; data: string }[] {
+    const rows = this.db
+      .prepare('SELECT seq, at, kind, data FROM audit_chain ORDER BY seq DESC LIMIT ?')
+      .all(limit) as unknown as { seq: number; at: number; kind: string; data: string }[]
+    return rows.map(row => ({ seq: Number(row.seq), at: Number(row.at), kind: row.kind, data: row.data }))
+  }
+
+  /**
+   * 审计链的密钥：首启随机生成，存进 meta。
+   * 说明：它与库在同一台机器上，所以这是"防悄悄改"而非"防有权限的人"。
+   */
+  private auditKey(): string {
+    const existing = this.getMeta('audit_key')
+    if (existing !== undefined) return existing
+    const key = randomBytes(32).toString('hex')
+    this.setMeta('audit_key', key)
+    return key
   }
 
   /**
