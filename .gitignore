@@ -1,0 +1,26 @@
+# 环境与秘密
+.env
+.env.*
+!.env.example
+
+# 依赖与构建产物
+node_modules/
+lib/
+dist/
+*.tsbuildinfo
+coverage/
+pnpm-debug.log
+.pnpm-store/
+.cache/
+tmp/
+
+# 编辑器与本地临时目录
+.DS_Store
+.idea/
+.vscode/
+.workbuddy/
+.worktrees/
+worktrees/
+
+# 测试临时产物
+pi/test/tmp-*.db*

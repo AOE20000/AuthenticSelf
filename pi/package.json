@@ -1,0 +1,63 @@
+{
+  "name": "@authentic-self/pi",
+  "version": "0.0.1",
+  "description": "AuthenticSelf for Pi: memory injection, self-recollection rounds, and forgetting",
+  "type": "module",
+  "license": "MIT",
+  "author": "AOE20000",
+  "homepage": "https://github.com/AOE20000/AuthenticSelf#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AOE20000/AuthenticSelf.git",
+    "directory": "pi"
+  },
+  "bugs": {
+    "url": "https://github.com/AOE20000/AuthenticSelf/issues"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "agent-memory",
+    "long-term-memory",
+    "forgetting",
+    "context-compaction",
+    "sqlite"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "pi": {
+    "extensions": [
+      "src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 \"test/*.test.mjs\""
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1",
+    "@earendil-works/pi-coding-agent": ">=1"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "test",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ]
+}
