@@ -70,7 +70,7 @@
   - `pointer.write`：压缩模块；
   - `trust.write`：**仅人侧命令**；
   - `audit.write`：内部记账。
-- **硬保障**：构造时运行 `verifyCapabilityTable()` 校验能力表与方法实现零漂移；越权调用抛 `CapabilityError` 并记 `as/capability_denied`（审计仅记方法名与能力名，不含入参原文）。严格直调闸门由 `AS_CAPABILITY=1` 控制。
+- **硬保障**：构造时运行 `verifyCapabilityTable()` 校验能力表与方法实现零漂移；越权调用抛 `CapabilityError` 并记 `as/capability_denied`（审计仅记方法名与能力名，不含入参原文）。**默认开启严格直调闸门**（设 `AS_CAPABILITY=0` 或测试传入 `{ strict: false }` 可临时退回宽松模式）。
 
 ### B6 监督与剔除载体（B6-a）
 
@@ -79,8 +79,9 @@
 
 ### B7 profile ⟂ profile（D20）
 
-- **隔离**：一套记忆 + 一套锚点 = 一个 profile（`AS_PROFILE` 隔离为独立目录与库文件 `profiles/<名>/memory.db`），跨 profile 不共享任何可变状态。
-- **导入规则**：只允许整包导入，且导入内容标记「此会话的上下文仅供参考」、以 `imported` 起步。多 profile 编排设计见 [`records/47-profile-orchestration.md`](records/47-profile-orchestration.md)。
+- **隔离**：一套记忆 + 一套锚点 = 一个 profile（`AS_PROFILE` 隔离为独立目录与库文件 `profiles/<名>/memory.db`），防路径穿越（`/`、`\`、纯 `.` / `..` 拒绝逃逸），跨 profile 不共享任何可变状态。
+- **可见性与校验**：启动时只读核对已有 `profiles/`（误拼新建空库即发出警告），`/as-profile` 只读枚举条数与 HMAC 链健康并对齐归一化名称（不做运行中热切库）；编排设计与边界见 [`records/47-profile-orchestration.md`](records/47-profile-orchestration.md)。
+- **导入规则**：只允许整包导入，且导入内容标记「此会话的上下文仅供参考」、以 `imported` 起步。
 
 ### B7-a 会话级信任等级（A9）
 

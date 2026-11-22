@@ -8,7 +8,7 @@
 # 用法：
 #   scripts/deploy.sh              只拷文件
 #   scripts/deploy.sh --with-env   顺带配环境变量（AS_ENABLED / AS_BYPASS_API_KEY）
-#   scripts/deploy.sh --with-env --capability   再加上 AS_CAPABILITY=1（严格闸）
+#   scripts/deploy.sh --with-env --capability   显式写入 AS_CAPABILITY=1（严格闸现已默认开启，设 0 可关）
 #
 # 部署的是**快照**：改完仓库里的代码要重跑本脚本（或用 --watch）。
 set -euo pipefail
@@ -63,18 +63,20 @@ echo "已部署 $(ls "$EXT_DIR"/*.ts | wc -l | tr -d ' ') 个模块到 $EXT_DIR"
 # pi 的 settings.json **没有 env 字段**，环境变量只能来自进程环境。
 # Windows 上用 setx 写到用户级环境变量，plain `pi` 在任何终端都能读到。
 if [ "$WITH_ENV" = "1" ]; then
-  command -v setx >/dev/null 2>&1 || { echo "找不到 setx，跳过环境变量" >&2; exit 0; }
-
-  setx AS_ENABLED 1 >/dev/null
-  echo "已设置 AS_ENABLED=1"
-
   # 旁路要自己调模型：key 从 pi 自己的 auth.json 里读，不另找一份。
   AUTH_JSON="$AGENT_DIR/auth.json"
+  KEY=""
   if [ -f "$AUTH_JSON" ]; then
-    # Git Bash 的 `/c/...` 路径 Python（Windows）打不开，要先换算成 Windows 路径。
     AUTH_WIN="$AUTH_JSON"
     command -v cygpath >/dev/null 2>&1 && AUTH_WIN="$(cygpath -w "$AUTH_JSON")"
-    KEY="$(python -c "
+    KEY="$(python3 -c "
+import json,io
+try:
+    d=json.load(io.open(r'''$AUTH_WIN''',encoding='utf-8'))
+    print(d.get('deepseek',{}).get('key',''))
+except Exception:
+    print('')
+" 2>/dev/null || python -c "
 import json,io
 try:
     d=json.load(io.open(r'''$AUTH_WIN''',encoding='utf-8'))
@@ -82,23 +84,36 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || true)"
+  fi
+
+  if ! command -v setx >/dev/null 2>&1; then
+    echo "非 Windows / 无 setx：请将以下环境变量写入 ~/.zshrc 或 ~/.bashrc："
+    echo "  export AS_ENABLED=1"
+    if [ -n "$KEY" ]; then
+      echo "  export AS_BYPASS_API_KEY=\"\$DEEPSEEK_API_KEY\"  # 或从 auth.json 中读取 deepseek.key"
+    else
+      echo "  export AS_BYPASS_API_KEY=<你的 DeepSeek API Key>"
+    fi
+    if [ "$WITH_CAPABILITY" = "1" ]; then
+      echo "  export AS_CAPABILITY=1  # 严格闸现已默认开启，设 0 可临时关闭"
+    fi
+  else
+    setx AS_ENABLED 1 >/dev/null
+    echo "已设置 AS_ENABLED=1"
     if [ -n "$KEY" ]; then
       setx AS_BYPASS_API_KEY "$KEY" >/dev/null
       echo "已设置 AS_BYPASS_API_KEY（取自 $AUTH_JSON 的 deepseek 条目）"
     else
       echo "没从 $AUTH_JSON 取到 deepseek key，跳过 AS_BYPASS_API_KEY" >&2
     fi
-  else
-    echo "找不到 $AUTH_JSON，跳过 AS_BYPASS_API_KEY" >&2
+    if [ "$WITH_CAPABILITY" = "1" ]; then
+      setx AS_CAPABILITY 1 >/dev/null
+      echo "已设置 AS_CAPABILITY=1（严格闸现已默认开启，设 AS_CAPABILITY=0 可关闭）"
+    else
+      echo "AS_CAPABILITY 默认开启（AS_CAPABILITY=0 可临时关闭严格闸）"
+    fi
+    echo "注意：setx 只影响**新开的**终端，当前这个 shell 要自己 export。"
   fi
-
-  if [ "$WITH_CAPABILITY" = "1" ]; then
-    setx AS_CAPABILITY 1 >/dev/null
-    echo "已设置 AS_CAPABILITY=1（严格闸：未走作用域的写调用一律拒绝）"
-  else
-    echo "AS_CAPABILITY 未设置 = 严格闸关着 = 今天的行为一字不变"
-  fi
-  echo "注意：setx 只影响**新开的**终端，当前这个 shell 要自己 export。"
 fi
 
 cat <<'EOF'

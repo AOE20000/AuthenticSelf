@@ -1,6 +1,7 @@
 # 记录 47：多 profile 编排与跨库审计（设计）
 
-> 本文件只定义设计边界与演进方向（不含代码实现），对应 [`08-completeness.md`](../08-completeness.md) D 表 B7。
+> 本文件定义多 profile 编排的设计边界与演进方向，对应 [`08-completeness.md`](../08-completeness.md) D 表 B7。
+> **现状**：第三节“推荐方案”三项已落地（[`pi/src/profile.ts`](../../pi/src/profile.ts) 只读枚举 `listProfiles()` + `normalizeProfileName()`、`commands.ts` `/as-profile` 对齐归一化名/明示 `AS_DB` 覆盖/存在性校验、`index.ts` 启动误拼提醒，单测见 `profile.test.mjs` 与 `index-hooks.test.mjs`）；运行中热切库仍按本文禁止。
 
 ---
 

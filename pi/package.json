@@ -36,7 +36,8 @@
     ]
   },
   "scripts": {
-    "test": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 \"test/*.test.mjs\""
+    "test": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 \"test/*.test.mjs\"",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=1",

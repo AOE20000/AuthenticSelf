@@ -2,7 +2,7 @@
 
 > 本文回答三个问题：**落在哪些钩子上、代码分成哪几块、怎么配置与调用**。
 > 实测细节见 [`records/`](records/)，权威完成度只在 [`08-completeness.md`](08-completeness.md)。
-> 形态：Pi 扩展（`pi/src/*.ts`，**22 个模块共 9,740 行**，无构建系统，宿主直接加载 TS）。
+> 形态：Pi 扩展（`pi/src/*.ts`，**26 个模块共 10,431 行**，无构建系统，宿主直接加载 TS）。
 
 ---
 
@@ -18,9 +18,9 @@
 
 | 钩子 | 职责 | 做什么 |
 |---|---|---|
-| `session_start` | 初始化与锚点 | 开库（含老库迁移与 `entry_tag` 回填）、校验 `audit_chain` 并报断点、按需启动 `view.ts` 查看服务与播种 `AS_SEED` |
+| `session_start` | 初始化与锚点 | 开库（含老库迁移、`entry_tag`/`entry_facet` 初始化与回填）、校验 `audit_chain` 并报断点、误拼空 profile 提醒、按需启动 `view.ts` 查看服务与播种 `AS_SEED` |
 | `context` | **视图层**（唯一改“模型所见”处） | 计算用量策略（70/85/95%）→ 前置计划块与 L0/L1/L2 锚点（打不可移出标记）→ 套用 `redaction` 清单 → 按轮压缩 / 纪要 / 折叠（均产出同源可恢复信号）；**会话存档一个字节都不动** |
-| `agent_before_settle` | **记忆旁路·阻塞相** | 双通道召回 + 预取过滤（A10）→ 记忆旁路裁决（`DROP/REWRITE/USED/REDACT/STEP`）→ 注入前二次脱敏（`rescanForInjection`）→ `custom_message` 注入并请求有界续步（≤ `AS_MAX_ROUNDS`） |
+| `agent_before_settle` | **记忆旁路·阻塞相** | 三通道召回（词 + 世界树/可达树 + `entry_facet`）与预取过滤（A10）→ 记忆旁路裁决（`DROP/REWRITE/USED/REDACT/STEP`）**并发**复杂请求 `PLAN_RULES` 预筛 → 注入前二次脱敏（`rescanForInjection`）→ `custom_message` 注入并请求有界续步（≤ `AS_MAX_ROUNDS`） |
 | `agent_start` / `agent_end` | **相位门与收尾** | `agent_start` 进阻塞相并记轮次；`agent_end` 切非阻塞相、跑收尾（`REMEMBER`/`PREFETCH`）并按轮去重（`wrapped_turn`） |
 | `message_end` | 线索与节拍 | 捕获 assistant reasoning 或正文作下一轮线索；遇用户新发言清轮次、清去重集、推维护节拍 |
 | `turn_end` | 宿主压缩（**默认关闭**） | 仅 `AS_COMPACT=1` 时调 `ctx.compact()`。默认关闭以遵守 `03` 裁定 1（避免按 step 触发 `abort()` 截断回答及丢失归档指针） |
@@ -32,42 +32,47 @@
 
 ## 三、代码分块
 
-扩展源码共 **22 个模块、9,740 行**（实测精确行数），按职责分列：
+扩展源码共 **26 个模块、10,431 行**（实测精确行数），按职责分列：
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| [`store.ts`](../pi/src/store.ts) | 3196 | SQLite 全部读写：记忆、世界树/多树挂载、锚点、归档指针、审计链、剔除、计划、联想、备注、待批、信任、评分与 B5 写能力闸门 |
-| [`index.ts`](../pi/src/index.ts) | 2460 | 钩子接线、相位门驱动、3 个工具与 18 个 `/as-*` 命令注册、旁路调用、B5 能力作用域装配 |
+| [`store.ts`](../pi/src/store.ts) | 3540 | SQLite 全部读写：记忆、世界树/嵌套挂载与 `resolveTag`、`entry_facet` 索引、锚点、归档指针（5000/2000）、审计链（事务化+`busy_timeout`）、剔除、计划、联想、备注、待批、信任、评分与默认开启的 B5 写能力闸门 |
+| [`index.ts`](../pi/src/index.ts) | 1847 | 钩子接线、相位门驱动、装配 `commands.ts` / `tools.ts`、并发阻塞相旁路调用与能力作用域装配 |
 | [`view.ts`](../pi/src/view.ts) | 544 | 上下文组成查看器（每步快照记录、只读 HTTP 页、离线 HTML 导出） |
 | [`turns.ts`](../pi/src/turns.ts) | 537 | 按轮切分、不可移出区标记与 `planFold`、折叠避让 `toolCall` 配对、按轮压缩渲染与解析 |
-| [`redact.ts`](../pi/src/redact.ts) | 296 | 纯函数：`applyRedactions()` 视图遮蔽、`scrubSecrets()` / `scrubDeep()` 密钥脱敏 |
+| [`commands.ts`](../pi/src/commands.ts) | 474 | 21 个 `/as-*` 人侧命令注册（含 `/as-profile` 只读枚举、`/as-tree`、`/as-mount`、`/as-facet`，全部走能力作用域） |
+| [`tools.ts`](../pi/src/tools.ts) | 310 | 模型可见工具注册（`memory` / `change` / `archive`）与交涉执行（全部走能力作用域） |
+| [`redact.ts`](../pi/src/redact.ts) | 301 | 纯函数：`applyRedactions()` 视图遮蔽（含变更下标）、`scrubSecrets()` / `scrubDeep()` 密钥脱敏 |
 | [`archive.ts`](../pi/src/archive.ts) | 283 | 六层时间粒度钳制、备注检索、按指针取原文、`unrecoverable()` 四因措辞 |
 | [`recover.ts`](../pi/src/recover.ts) | 255 | 「已移出可恢复」信号的**唯一出处**（同源指引措辞 + 指针构造） |
-| [`compress.ts`](../pi/src/compress.ts) | 247 | 三档注入策略（70/85/95%）、对话转录渲染、旁路摘要调用 |
+| [`compress.ts`](../pi/src/compress.ts) | 248 | 三档注入策略（70/85/95%）、对话转录渲染、旁路摘要调用 |
 | [`salience.ts`](../pi/src/salience.ts) | 240 | 显著性绝对分模型纯函数（幂等、可解释、判用递增与 90 天衰减） |
-| [`facet.ts`](../pi/src/facet.ts) | 224 | 事件时间封闭词表解析器（`resolveTimeRange`，索引化第一步） |
+| [`facet.ts`](../pi/src/facet.ts) | 224 | 事件时间封闭词表解析器（`resolveTimeRange`/`parseTimeExpression`/`overlaps`，接入 `add` 与 `recall`） |
 | [`memory.ts`](../pi/src/memory.ts) | 208 | 记忆旁路（阻塞相）提示词规则、候选渲染与 `DROP/REWRITE/USED/REDACT/STEP` 解析 |
 | [`inject.ts`](../pi/src/inject.ts) | 202 | 注入片段渲染（含新旧状态与区间）、A10 字面前缀去重、注入前二次扫描 |
-| [`maintain.ts`](../pi/src/maintain.ts) | 178 | 维护旁路提示词与行式解析（`MARK/REMEMBER/MERGE/SUPERSEDE/TAG/MERGE_TAG/PRUNE_TAG`）、世界树渲染 |
+| [`maintain.ts`](../pi/src/maintain.ts) | 191 | 维护旁路提示词与行式解析（`MARK/REMEMBER/MERGE/SUPERSEDE/TAG/MERGE_TAG/PRUNE_TAG/ENTITY`）、世界树渲染 |
 | [`intent.ts`](../pi/src/intent.ts) | 161 | `memory` 交涉五动作解析、`change` 结构化反思解析 |
 | [`digest.ts`](../pi/src/digest.ts) | 141 | 写入时转存判断（`doc_verdict` + `summary`）与整段纪要解析 |
+| [`profile.ts`](../pi/src/profile.ts) | 141 | Profile 路径隔离（防 `..`/`.`/`\` 逃逸）、名称归一化与 `listProfiles` 只读元数据/审计校验 |
 | [`approve.ts`](../pi/src/approve.ts) | 116 | 审批者提示词、信息隔离输入构造、裁定解析 |
 | [`phase.ts`](../pi/src/phase.ts) | 92 | 两相状态机（阻塞相 / 非阻塞相，越相拒绝不抛异常） |
 | [`digest-view.ts`](../pi/src/digest-view.ts) | 87 | 纪要压缩的视图构造纯函数（含不可移出区保留与可恢复信号） |
-| [`wrapup.ts`](../pi/src/wrapup.ts) | 69 | 收尾相提示词（`REMEMBER user\|model` 沉淀 + `PREFETCH` 预取）与解析 |
 | [`anchors.ts`](../pi/src/anchors.ts) | 77 | L0 常量（`Object.freeze`）+ 指纹 + L1/L2 锚点渲染 |
+| [`wrapup.ts`](../pi/src/wrapup.ts) | 69 | 收尾相提示词（`REMEMBER user\|model` 沉淀 + `PREFETCH` 预取）与解析 |
 | [`pending.ts`](../pi/src/pending.ts) | 65 | 待批写入队列按来源统计、过滤与行格式化 |
 | [`plan.ts`](../pi/src/plan.ts) | 62 | 复杂请求预筛、立计划提示词与解析 |
+| [`tools-helpers.ts`](../pi/src/tools-helpers.ts) | 16 | `intent`/`approve` 工具与命令间的共享文本与规则桥接 helper |
 
-**单测**：[`pi/test/`](../pi/test) 下 **22 个 `.test.mjs` 脚本共 3,631 行**，无测试框架，依赖 Node ≥ 22.6 的 `--experimental-strip-types` 直接跑 TS：
+**单测**：[`pi/test/`](../pi/test) 下 **24 个 `.test.mjs` 脚本共 4,443 行**，无测试框架，依赖 Node ≥ 22.6 的 `--experimental-strip-types` 直接跑 TS：
 
 ```sh
 cd pi
-npm test                                                              # 跑全部 22 个脚本
+npm test                                                              # 跑全部 24 个脚本
 node --experimental-strip-types --no-warnings test/entry-tag.test.mjs # 单跑一个
+npm run typecheck                                                     # 需环境已装 tsc，使用 pi/tsconfig.json
 ```
 
-> 单测覆盖纯函数、存储层与回归边界；钩子级端到端需通过 `pi --extension ./src/index.ts` 或用户扩展目录加载真会话验证。
+> 单测覆盖纯函数、存储层与回归边界（含 `index-hooks.test.mjs` 对 `index.ts` 钩子的 Mock 集成回归）；真实模型端到端仍需通过 `pi --extension ./src/index.ts` 或用户扩展目录加载真会话验证。
 
 ---
 
@@ -81,7 +86,7 @@ node --experimental-strip-types --no-warnings test/entry-tag.test.mjs # 单跑�
 | `change({ say, reason })` | 写原语 | 提交 L1/L2 身份变更声明：落 `pending_change`，经隔离审批者标准化/裁定与双维冷却后生效 |
 | `archive({ q?, key? })` | 只读通道 | `q` 查索引摘要（R2，每轮限 2 次）；`key` 按六层时间下钻取原文（R3）；只读不计入写原语 |
 
-### 4.2 人侧命令（18 个 `/as-*`）
+### 4.2 人侧命令（21 个 `/as-*`）
 
 | 分类 | 命令 | 作用 |
 |---|---|---|
@@ -89,7 +94,10 @@ node --experimental-strip-types --no-warnings test/entry-tag.test.mjs # 单跑�
 | | `/as-memory` | 列出记忆库前 20 条（含状态、取代指针与转存建议） |
 | | `/as-audit` | 查看最近 12 条审计并校验 HMAC 链完整性 |
 | | `/as-scrub-scan` | 只读脱敏体检：列出库中仍含明文凭据的旧条目 |
-| | `/as-profile [名]` | 查看当前 profile 与库路径；给出切库启动命令（不运行中切库） |
+| | `/as-profile [名]` | 只读枚举 `profiles/` 条数与链健康；检查目标库存在性与切库启动命令（不运行中热切） |
+| **世界树与索引** | `/as-tree [create <名>]` | 列出世界树及可达性/挂载状态，或新建子树 |
+| | `/as-mount [attach\|detach ...]` | 将子树挂至全局父路径（支持 `readonly`）或卸载（不删记忆与枝） |
+| | `/as-facet [list\|proposed\|add\|approve\|dismiss]` | 管理条目的 `cue`/`entity`/`time` 索引及审核维护提案 |
 | **归档备注** | `/as-archive [参数]` | 日期粒度参数走时间下钻；非日期参数按会话备注检索 |
 | | `/as-note [文本]` | 为当前会话写注脚；无参数列出本会话备注 |
 | **大改审批** | `/as-pending` | 列出待批大改申请（含结构化反思与冷却状态） |
@@ -129,7 +137,7 @@ node --experimental-strip-types --no-warnings test/entry-tag.test.mjs # 单跑�
 | **维护 / 门控 / 积压** | `AS_MAINT_EVERY` / `_WINDOW` / `_MEMORY` | `10` / `10` / `20` | 维护节拍、看最近轮数、看记忆条数 |
 | | `AS_CHANGE_COOLDOWN_MIN` / `_TURNS` | `10` / `2` | 大改冷却分钟数与轮次（取交集） |
 | | `AS_PENDING_MAX` | `50` | 单会话积压上限，到线丢弃新写入 |
-| **安全与隔离** | `AS_CAPABILITY` | 关 | `1` 开启 B5 存储层严格直调写闸门 |
+| **安全与隔离** | `AS_CAPABILITY` | **开** | 默认开启 B5 存储层严格直调写闸门；设 `0` 可临时退回宽松直调 |
 | | `AS_SCRUB_BASE64` | 开 | `0` 关闭 base64/hex 脱敏规则 |
 | **观测与超时** | `AS_VIEW` / `AS_VIEW_PORT` / `AS_VIEW_SNAPSHOT` | 关 / `4787` / 空 | 只读上下文查看器开关、端口与退出导出 HTML 路径 |
 | | `AS_*_TIMEOUT` | `12000`–`20000` ms | 各旁路 idle 超时（`DOC`/`INTENT`/`REALTIME` 12s；`SUMMARY`/`APPROVER`/`WRAPUP`/`PLAN`/`DIGEST` 15s；`MAINT` 20s） |
@@ -180,7 +188,7 @@ node --experimental-strip-types --no-warnings test/entry-tag.test.mjs # 单跑�
 | 35 | 三档阈值（70/85/95%） | ✅ `compress.ts` 统一策略 + `index.ts` 接线 | [`35-three-thresholds`](records/35-three-thresholds.md) |
 | 36 | B10 与 A11 裁定 | ✅ `q` 复核通过 + R2 限流 + 宿主压缩默认关 | [`36-b10-a11-adjudication`](records/36-b10-a11-adjudication.md) |
 | 37 | 注入前二次扫描与深度消毒 | ✅ 递出前净化 + `scrubDeep` 封堵说明字段泄漏 | [`37-injection-rescan`](records/37-injection-rescan.md) |
-| 38 | 索引化设计（线索/实体/时间） | 🟡 `entry_facet` 三步设计；第 1 步时间解析已抽入 `facet.ts` | [`38-indexing-design`](records/38-indexing-design.md) |
+| 38 | 索引化设计（线索/实体/时间） | ✅ 第 1–2 步落地：`entry_facet` 三通道召回 + `/as-facet` + `ENTITY` 提案 | [`38-indexing-design`](records/38-indexing-design.md) |
 | 39 | 不可移出区绝对优先权 | ✅ 计划块不再消失/被折，统一会话键归一化 | [`39-protected-zone`](records/39-protected-zone.md) |
 | 40 | B5 写能力分级设计 | 🟡 能力矩阵与存储层方案定稿 | [`40-b5-capability-design`](records/40-b5-capability-design.md) |
 | 41 | 二次扫描端到端与新漏洞 | ✅ 两条防线同时命中，暴露并修复 `reason` 明文漏洞 | [`41-e2e-rescan-and-leak`](records/41-e2e-rescan-and-leak.md) |
@@ -189,7 +197,7 @@ node --experimental-strip-types --no-warnings test/entry-tag.test.mjs # 单跑�
 | 44 | 用户扩展目录部署 | ✅ plain `pi` 自动发现并跑通写入 → 召回 | [`44-user-dir-deploy`](records/44-user-dir-deploy.md) |
 | 45 | 能力闸多轮/工具/真压缩复验 | ✅ 三条压缩路径 `asPointer` 全触发、越权 0 条 | [`45-capability-multiturn-verify`](records/45-capability-multiturn-verify.md) |
 | 46 | `salience` 绝对评分模型 | ✅ 幂等、可解释、判用递增与 90 天衰减 | [`46-salience-scoring`](records/46-salience-scoring.md) |
-| 47 | 多 profile 编排（设计） | 🟡 推荐不做进程内切库，先补只读枚举与身份标识 | [`47-profile-orchestration`](records/47-profile-orchestration.md) |
+| 47 | 多 profile 编排（设计） | ✅ 推荐三项落地：`listProfiles` 只读枚举、展示名对齐、误拼提醒（不做热切） | [`47-profile-orchestration`](records/47-profile-orchestration.md) |
 | 48 | 折叠拆散 `toolCall` 配对修复 | ✅ 带 `toolCall` 的 assistant 永不折 + 回归测试 | [`48-fold-toolcall-pairing`](records/48-fold-toolcall-pairing.md) |
 | 49 | 世界树 P-a：`entry_tag` 地基 | ✅ 建表、回填、不变量自检（零行为变更） | [`49-entry-tag-p-a`](records/49-entry-tag-p-a.md) |
 | 50 | 世界树 P-b：注入标新旧 | ✅ `history` 带出同槽旧值 + 区间标记 | [`50-inject-timeline-p-b`](records/50-inject-timeline-p-b.md) |

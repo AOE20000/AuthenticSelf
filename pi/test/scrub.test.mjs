@@ -133,7 +133,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 11. store.add()：落库的是脱敏后文本 ────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const raw = `用户的 OpenAI key 是 ${SK}，别外传`
   const entry = s.add(raw, { origin: 'user' })
   const stored = s.list()[0]
@@ -155,7 +155,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 13. addInSlot()：同槽写入同一条路径也脱敏 ──────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.ensureTag('记忆/项目')
   const raw = `项目 token 是 ${SK}`
   const written = s.addInSlot(raw, { origin: 'user', tagPath: '项目/Halcyon' })
@@ -170,7 +170,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 14. setSummary()：摘要也要脱敏 ─────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const id = s.add('项目用 Postgres 做存储', { origin: 'model' }).id
   const before = s.recentAudit(20).filter(row => row.kind === 'as/scrub').length
   const okSet = s.setSummary(id, `摘要：部署密钥 ${SK}`)
@@ -185,7 +185,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 15. 不对称：note / anchor 不脱敏（人的原话与身份层）─────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.addNote('sess-1', `注脚里写了 ${SK}`)
   const anchorId = s.addAnchor(`身份叙述里提到 ${SK}`, { origin: 'human' })
   check('15a 备注原样保留（人写的注脚，不是库的正文）',

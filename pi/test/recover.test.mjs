@@ -34,7 +34,7 @@ function makeSessionFile(entries) {
 
 // ── 1. 三条路径都必须同时给"指引"和"指针" ─────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const stamp = Date.UTC(2026, 10, 18, 3, 0, 0)
 
   // ① 按轮压缩（`applyCompression` 走的是 `movedNotice`）
@@ -60,7 +60,7 @@ function makeSessionFile(entries) {
 
 // ── 2. 纪要分支的指针写进库后，`archive(q)` 真能搜到 ────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const stamp = Date.UTC(2026, 10, 18, 3, 0, 0)
   const signal = segmentSignal({
     turn: 0, timestamp: stamp, title: '迁移顺序', chars: 1200,
@@ -83,7 +83,7 @@ function makeSessionFile(entries) {
     { message: { role: 'toolResult', content: original, timestamp: stamp + 1_000 } },
     { message: { role: 'user', content: '下一步呢', timestamp: stamp + 600_000 } },
   ])
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const signal = segmentSignal({ turn: 0, timestamp: stamp, title: '迁移脚本', chars: 120, summary: '脚本第三步失败' })
   s.addArchiveRefs([signal.ref], file)
 

@@ -212,14 +212,15 @@ export function shouldFreezeInjection(usage: UsageLike | undefined, threshold = 
  * @param systemPrompt - 按情况选好的提示词。
  * @param signal - 取消信号。
  * @returns 纪要文本；失败返回 undefined，由调用方回退到确定性折叠。
- */export async function summarize(
+ */
+export async function summarize(
   transcript: string,
   systemPrompt: string,
   signal: AbortSignal,
 ): Promise<string | undefined> {
   const apiKey = process.env.AS_BYPASS_API_KEY ?? process.env.DEEPSEEK_API_KEY
   if (apiKey === undefined || apiKey === '') return undefined
-  const baseUrl = process.env.AS_BYPASS_BASE_URL ?? 'https://api.deepseek.com'
+  const baseUrl = (process.env.AS_BYPASS_BASE_URL ?? 'https://api.deepseek.com').trim().replace(/\/+$/u, '')
   const model = process.env.AS_BYPASS_MODEL ?? 'deepseek-chat'
 
   try {

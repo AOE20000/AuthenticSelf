@@ -20,7 +20,7 @@ function read(store, sql, ...args) {
 
 // ── 1. 默认受信任 / 切换 / 会话之间互不影响 ─────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   check('1a 没有记录的会话一律 trusted', s.getTrust('sess-a') === 'trusted', `state=${s.getTrust('sess-a')}`)
   s.setTrust('sess-a', 'untrusted')
   check('1b setTrust(untrusted) 能读回', s.getTrust('sess-a') === 'untrusted', `state=${s.getTrust('sess-a')}`)
@@ -33,7 +33,7 @@ function read(store, sql, ...args) {
 
 // ── 2. 不受信任时入队，且记忆库条数不变（关键边界）──────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.add('一条已经存在的受信任记录', { origin: 'user' })
   const before = s.list().length
   const id = s.enqueueWrite({
@@ -54,7 +54,7 @@ function read(store, sql, ...args) {
 
 // ── 3. 采纳：这时才入库，origin / trust / tag 按原样 ────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const before = s.list().length
   const id = s.enqueueWrite({
     sessionFile: 'sess-a',
@@ -83,7 +83,7 @@ function read(store, sql, ...args) {
 
 // ── 4. 无视：标 ignored，不落库、不删正文 ───────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const before = s.list().length
   const id = s.enqueueWrite({ sessionFile: 'sess-a', text: '这条会被无视掉', origin: 'model' })
   const ok = s.dismissWrite(id)
@@ -97,7 +97,7 @@ function read(store, sql, ...args) {
 
 // ── 5. 文本太短不入队 ───────────────────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   check('5a 3 个字 → undefined', s.enqueueWrite({ sessionFile: 'sess-a', text: '三个字', origin: 'model' }) === undefined)
   check('5b 只有空白 → undefined', s.enqueueWrite({ sessionFile: 'sess-a', text: '    ', origin: 'model' }) === undefined)
   check('5c 恰好 4 个字 → 入队', s.enqueueWrite({ sessionFile: 'sess-a', text: '四个字啊', origin: 'model' }) !== undefined)
@@ -106,7 +106,7 @@ function read(store, sql, ...args) {
 
 // ── 6. listPendingWrites：只看 pending，按会话过滤 ──────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const a1 = s.enqueueWrite({ sessionFile: 'sess-a', text: '会话 A 的第一条积压', origin: 'model' })
   s.enqueueWrite({ sessionFile: 'sess-a', text: '会话 A 的第二条积压', origin: 'user' })
   s.enqueueWrite({ sessionFile: 'sess-b', text: '会话 B 的积压', origin: 'model' })
@@ -124,7 +124,7 @@ function read(store, sql, ...args) {
 
 // ── 7. 切回 trusted 不追认积压（02 §5.4-1）──────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.setTrust('sess-a', 'untrusted')
   const id = s.enqueueWrite({ sessionFile: 'sess-a', text: '切回受信任之前攒下的那条', origin: 'model' })
   const before = s.list().length
@@ -156,7 +156,7 @@ function read(store, sql, ...args) {
   old.prepare("INSERT INTO memory_entry (id, kind, text, span, origin, trust, t_start) VALUES ('m-old', 'fact', '旧库里的条目', 'short', 'user', 0.9, ?)").run(Date.now())
   old.close()
 
-  const s = new Store(file)
+  const s = new Store(file, { strict: false })
   const tables = s.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session_trust', 'pending_write') ORDER BY name")
     .all().map(row => row.name)
   check('8a 两张表被自动补上', tables.join(',') === 'pending_write,session_trust', `tables=${tables.join(',')}`)

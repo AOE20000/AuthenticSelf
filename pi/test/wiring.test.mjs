@@ -43,7 +43,7 @@ function check(name, ok, detail = '') {
 
 // ── 2. 计划步骤：completeStep 是唯一写 ✓ 的地方 ─────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const file = '/tmp/session-a.jsonl'
   check('2a 立计划', s.savePlan(file, '把迁移做完', ['盘点依赖', '改配置', '回放验证'], '谁来值班？') === true)
 
@@ -68,7 +68,7 @@ function check(name, ok, detail = '') {
 
 // ── 3. 降权与维护节拍互不干扰 ───────────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const DAY = 86_400_000
   const old = s.add('很久没被想起的一条', { origin: 'user', salience: 0.9 })
   s.db.prepare('UPDATE memory_entry SET t_start = ? WHERE id = ?').run(Date.now() - 40 * DAY, old.id)
@@ -94,7 +94,7 @@ function check(name, ok, detail = '') {
 
 // ── 4. 组合：一轮里 A10 过滤 + STEP 推进 + 降权可以同时发生 ─────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const DAY = 86_400_000
   const file = '/tmp/session-b.jsonl'
 

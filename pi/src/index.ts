@@ -18,11 +18,13 @@
  *   AS_SEED='["..."]'   库为空时播种（仅测试用）
  */
 
-import { appendFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { appendFileSync, existsSync } from 'node:fs'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
-import { Type } from '@earendil-works/pi-ai'
 import { defaultDbPath, Store } from './store'
-import { countByOrigin, filterByOrigin, formatOriginBreakdown, formatPendingLine } from './pending'
+import { listProfiles, normalizeProfileName } from './profile'
+import { registerCommands } from './commands'
+import { registerTools } from './tools'
 import {
   allowedUnderLimit,
   injectionCap,
@@ -38,14 +40,11 @@ import {
 } from './compress'
 import { MAINTENANCE_RULES, parseMaintenance, renderMemoryList, renderTagTree } from './maintain'
 import { l0Digest, renderAnchors } from './anchors'
-import { CHANGE_RULES, INTENT_RULES, parseChange, parseIntent } from './intent'
-import { APPROVER_PROMPT, buildApproverInput, parseVerdict } from './approve'
 import { DIGEST_RULES, DOC_RULES, parseDigest, parseDocVerdict } from './digest'
 import { WRAPUP_RULES, parseWrapup } from './wrapup'
 import { PhaseGate } from './phase'
 import { looksComplex, parsePlan, PLAN_RULES } from './plan'
 import { applyRedactions, scrubSecrets } from './redact'
-import { grainOf, readExcerpt, renderArchiveView, renderNoteSearch, unrecoverable } from './archive'
 import { resolve } from 'node:path'
 import { snapshotHtml, startViewServer, ViewRecorder } from './view.ts'
 import { alreadyInContext, dateLabel, normalizeForMatch, render, rescanForInjection } from './inject'
@@ -65,6 +64,31 @@ import { type ArchiveRefDraft, type RecoverySignal } from './recover'
 import { buildDigestView } from './digest-view'
 
 const flag = (value: string | undefined): boolean => value === '1' || value === 'true'
+
+/** 解析环境变量中的数值，坏值/越界一律退回默认值，避免 `NaN` 静默关停阈值。 */
+function numEnv(
+  name: string,
+  fallback: number,
+  options: { min?: number; max?: number; int?: boolean } = {},
+): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) return fallback
+  if (options.min !== undefined && parsed < options.min) return fallback
+  if (options.max !== undefined && parsed > options.max) return fallback
+  return options.int === true ? Math.floor(parsed) : parsed
+}
+
+/** 统一抽取消息或内容块数组里的纯文本。 */
+function extractText(content: unknown, sep = '\n'): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter(block => (block as { type?: string }).type === 'text')
+    .map(block => String((block as { text?: string }).text ?? ''))
+    .join(sep)
+}
 
 interface State {
   /** 本句用户发言内已注入的轮数。 */
@@ -147,13 +171,7 @@ function hasAnchorBlock(messages: readonly unknown[]): boolean {
 
 /** 取消息里的纯文本（用户发言用）。 */
 function plainText(message: unknown): string {
-  const content = (message as { content?: unknown }).content
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter(block => (block as { type?: string }).type === 'text')
-    .map(block => String((block as { text?: string }).text ?? ''))
-    .join('\n')
+  return extractText((message as { content?: unknown }).content, '\n')
 }
 
 /** 从消息内容里取推理；没有推理就退回正文。 */
@@ -199,8 +217,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
   trace('factory:start')
   const enabled = flag(process.env.AS_ENABLED)
-  const maxRounds = Number(process.env.AS_MAX_ROUNDS ?? 3)
-  const perRecall = Number(process.env.AS_PER_RECALL ?? 2)
+  const maxRounds = numEnv('AS_MAX_ROUNDS', 3, { min: 0, int: true })
+  const perRecall = numEnv('AS_PER_RECALL', 2, { min: 1, int: true })
   // 宿主压缩（pi 的 compaction）**默认关闭**：`03` §6 裁定 1 说得很直白——
   // 「接管。关掉 pi 的裁剪，全部走本方案的五区」。
   //
@@ -213,19 +231,19 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   //
   // 要开它得显式 `AS_COMPACT=1`，开之前先读 `records/36` §二里那两条待补实验。
   const compactionOn = process.env.AS_COMPACT === '1'
-  const reserve = Number(process.env.AS_RESERVE ?? 8192)
-  const compactAt = Number(process.env.AS_COMPACT_AT ?? 0.85)
+  const reserve = numEnv('AS_RESERVE', 8192, { min: 0, int: true })
+  const compactAt = numEnv('AS_COMPACT_AT', 0.85, { min: 0.05, max: 1 })
   const debug = flag(process.env.AS_DEBUG)
-  const compactMin = Number(process.env.AS_COMPACT_MIN ?? 25000)
-  const foldAt = Number(process.env.AS_FOLD_AT ?? 0.6)
-  const foldKeep = Number(process.env.AS_FOLD_KEEP ?? 2)
-  const turnBatch = Number(process.env.AS_TURN_BATCH ?? 10)
-  const keepRecent = Number(process.env.AS_KEEP_RECENT ?? 2)
+  const compactMin = numEnv('AS_COMPACT_MIN', 25000, { min: 0, int: true })
+  const foldAt = numEnv('AS_FOLD_AT', 0.6, { min: 0.05, max: 1 })
+  const foldKeep = numEnv('AS_FOLD_KEEP', 2, { min: 1, int: true })
+  const turnBatch = numEnv('AS_TURN_BATCH', 10, { min: 1, int: true })
+  const keepRecent = numEnv('AS_KEEP_RECENT', 2, { min: 1, int: true })
   const dupPolicy = process.env.AS_DUP === 'drop' ? 'drop' as const : 'placeholder' as const
   const turnCache = new Map<string, Map<number, TurnResult>>()
-  const maintEvery = Number(process.env.AS_MAINT_EVERY ?? 10)
-  const maintWindow = Number(process.env.AS_MAINT_WINDOW ?? 10)
-  const maintMemoryWindow = Number(process.env.AS_MAINT_MEMORY ?? 20)
+  const maintEvery = numEnv('AS_MAINT_EVERY', 10, { min: 0, int: true })
+  const maintWindow = numEnv('AS_MAINT_WINDOW', 10, { min: 2, int: true })
+  const maintMemoryWindow = numEnv('AS_MAINT_MEMORY', 20, { min: 1, int: true })
   // 显著性的两套口径（P19）：评分按证据重算**绝对值**（幂等），降权在当前值上
   // **乘 0.85**（不幂等，靠 meta.decay_at 闸）。两者改的是同一个字段，谁后跑谁生效，
   // 同时跑会把"闲置即降"算两遍——所以二选一。默认评分；`AS_SALIENCE=0` 退回旧口径
@@ -233,16 +251,15 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const salienceOn = (process.env.AS_SALIENCE ?? '1').trim() !== '0'
   const realtimeOn = process.env.AS_REALTIME !== '0'
   // 联想带的预算：`link` 禁止无预算扩散（01 §6.3），一次最多带出这么多条
-  const linkBudget = Number(process.env.AS_LINK_BUDGET ?? 2)
+  const linkBudget = numEnv('AS_LINK_BUDGET', 2, { min: 0, int: true })
   // 长条目注入的硬上限：选 full 却超过它，只能降级为节选（§5.2）
-  const longBudget = Number(process.env.AS_LONG_BUDGET ?? 1200)
+  const longBudget = numEnv('AS_LONG_BUDGET', 1200, { min: 100, int: true })
   // 冷却的**轮次维**（§7.4 写的是"N 轮或 N 小时"，两个维都要满足）
-  const cooldownTurns = Number(process.env.AS_CHANGE_COOLDOWN_TURNS ?? 2)
+  const cooldownTurns = numEnv('AS_CHANGE_COOLDOWN_TURNS', 2, { min: 0, int: true })
   // 单会话积压上限（`01` §13「积压无界增长 → 超过上限停止该会话下沉」）。
   // 到线后**丢弃新写入**而不是顶掉最旧的：见 docs/records/32。
   // 坏值（非数字 / ≤0）退回默认 50——上限是"防止无界"的闸，不该被一个错的环境变量关掉。
-  const pendingMaxRaw = Number(process.env.AS_PENDING_MAX ?? 50)
-  const pendingMax = Number.isFinite(pendingMaxRaw) && pendingMaxRaw >= 1 ? Math.floor(pendingMaxRaw) : 50
+  const pendingMax = numEnv('AS_PENDING_MAX', 50, { min: 1, int: true })
 
   if (!enabled) {
     pi.on('session_start', async (_event, ctx) => {
@@ -251,33 +268,14 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     return
   }
 
-  const store = new Store(process.env.AS_DB || undefined)
+  const explicitProfile = (process.env.AS_PROFILE ?? '').trim()
+  const dbOverride = process.env.AS_DB?.trim() ?? ''
+  const dbPath = dbOverride !== '' ? dbOverride : defaultDbPath()
+  const existedBeforeOpen = dbPath === ':memory:' || existsSync(dbPath)
+  const store = new Store(dbPath)
 
   /**
-   * 各旁路的**写能力作用域**（`02` B5 / 记录 42 §4）。
-   *
-   * **作用域按能力分，不按函数分**——理由是权限表的粒度：
-   * 粒度太细（每个函数一个作用域）就没人看得懂"谁能写什么"；
-   * 太粗（一个全权作用域）就等于没分。
-   * 能力的划分来自**这张表写的是哪一类东西**（记录 40 §1）：
-   *
-   * | 作用域 | 持有者 | 写什么 |
-   * |---|---|---|
-   * | `asMemory` | 收尾相、维护旁路 | 记忆条目本体 |
-   * | `asTouch` | 维护旁路 | 权重（判用加分、评分、批量降权） |
-   * | `asSuppress` / `asSupersede` | 交涉通道、维护旁路 | 软抑制、取代 |
-   * | `asRelation` | 维护旁路 | 标签与关联 |
-   * | `asRedaction` | 记忆旁路·阻塞相 | 剔除清单 |
-   * | `asPlan` | 记忆旁路·阻塞相 | 计划区 |
-   * | `asAnchor` | 大改申请链 | 身份层 |
-   * | `asPointer` | 压缩侧 | 归档指针 |
-   * | `asTrust` | **人侧命令** | 会话信任与积压 |
-   * | `asAudit` | 内部 | 记账 |
-   *
-   * **能力集是硬编码的**（记录 40 §3）：权限表若可配置，它本身就成了新的可写状态。
-   *
-   * 开关 `AS_CAPABILITY=1` 时，**未走作用域的写调用一律拒绝**——
-   * 默认关着，所以今天的行为一字不变；接线完成后由人决定何时开。
+   * 各旁路的**写能力作用域**（`02` B5 / 记录 42 §4，P2-A 起默认开启，可用 `AS_CAPABILITY=0` 关闭）。
    */
   const asMemory = store.scoped('memory.write')
   const asTouch = store.scoped('memory.touch')
@@ -290,12 +288,13 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   const asPointer = store.scoped('pointer.write')
   const asTrust = store.scoped('trust.write')
   const asAudit = store.scoped('audit.write')
+  const asTree = store.scoped('tree.write')
   /** 已经报过"积压到上限"的会话：同一条会话只记一次审计（内存 Set，进程内够用）。 */
   const overflowNotified = new Set<string>()
   // 上下文组成查看器（`view.ts`）：默认关闭，只读，只绑 127.0.0.1。
   // 开着它也不参与任何决策——坏了最多是页面空白，不该影响对话。
   const viewEnabled = (process.env.AS_VIEW ?? '') === '1'
-  const viewPort = Number(process.env.AS_VIEW_PORT ?? 4787)
+  const viewPort = numEnv('AS_VIEW_PORT', 4787, { min: 1, max: 65535, int: true })
   const viewSnapshotPath = (process.env.AS_VIEW_SNAPSHOT ?? '').trim()
   const viewRecorder = new ViewRecorder()
   let viewServer: { close: () => void; port: number } | undefined
@@ -322,6 +321,8 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     archiveQueriesTurn: -1,
     overflowDropped: 0,
   }
+  let pendingWrapup: Promise<void> | undefined
+  const pendingDocs = new Set<Promise<void>>()
 
   /** 库为空时播种。仅用于测试，正式形态应由下行旁路写入。 */
   const seed = process.env.AS_SEED
@@ -340,7 +341,23 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   }
 
   pi.on('session_start', async (_event, ctx) => {
+    const check = store.verifyAudit()
+    if (!check.ok) {
+      // 不阻断使用：链断了是"证据被动过"，不是"系统不能跑"
+      process.stderr.write(`[as] 审计链断裂于第 ${check.brokenAt ?? '?'} 条：${check.reason ?? '未知原因'}\n`)
+      asAudit.appendAudit('as/audit_broken', { brokenAt: check.brokenAt ?? 0, reason: check.reason ?? '', count: check.count })
+    } else {
+      asAudit.appendAudit('as/session_start', { auditCount: check.count, l0: l0Digest() })
+    }
     notify(ctx, `AuthenticSelf 就绪：${store.count()} 条记忆`, 'info')
+    if (explicitProfile !== '' && dbOverride === '' && !existedBeforeOpen) {
+      let norm = explicitProfile
+      try { norm = normalizeProfileName(explicitProfile) } catch { /* keep raw */ }
+      const others = listProfiles().filter(item => item.name !== norm).map(item => item.name)
+      if (others.length > 0) {
+        notify(ctx, `注意：profile「${norm}」为新建空库（已有 profile：${others.join('、')}），若系拼写错误可用 /as-profile 核对。`, 'warn')
+      }
+    }
     if (!viewEnabled || viewServer !== undefined) return
     try {
       viewServer = await startViewServer({
@@ -354,36 +371,37 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     }
   })
 
-  // 给人看的窗口：主 AI 实际收到的是压缩后的视图，存档里是原文。
-  // 这个命令把"它看到了什么"打印出来，不改变任何东西。
-  pi.registerCommand('as-view', {
-    description: '查看主 AI 实际看到的上下文（压缩后各轮的处置）',
-    handler: async (_args: string, ctx: unknown) => {
-      if (state.lastView.length === 0) {
-        notify(ctx, '还没有发生过压缩——主 AI 看到的就是原文。', 'info')
-        return
-      }
-      const head = `上次压缩（占用 ${(state.lastViewAt * 100).toFixed(1)}%）：`
-      notify(ctx, [head, ...state.lastView].join('\n'), 'info')
-    },
+  // 注册人侧命令与模型工具后，仍需在 index.ts 完成相位门、视图和钩子驱动。
+  trace('before:registerTool')
+  registerCommands(pi, {
+    store,
+    asTrust,
+    asAnchor,
+    asAudit,
+    asTree,
+    asRelation,
+    pendingMax,
+    sessionFileOf,
+    sessionKey,
+    notify,
+    state,
   })
-
-  pi.registerCommand('as-memory', {
-    description: '查看记忆库里的条目（含已抑制与被取代的）',
-    handler: async (_args: string, ctx: unknown) => {
-      const entries = store.list()
-      if (entries.length === 0) {
-        notify(ctx, '记忆库是空的', 'info')
-        return
-      }
-      const lines = entries.slice(0, 20).map(entry => {
-        const tail = entry.replacedBy === undefined ? '' : ` → ${entry.replacedBy}`
-        const doc = entry.docVerdict === 'doc' ? `  ※建议转存文档（${entry.docReason || '未给理由'}）` : ''
-        return `${entry.state.padEnd(10)} [${entry.tag ?? '未分类'}] ${entry.text.slice(0, 36)}${tail}${doc}`
-      })
-      notify(ctx, [`记忆库（${entries.length} 条 / ${store.tagPaths().length} 个标签，显示前 20）`, ...lines].join('\n'), 'info')
-    },
+  const gate = new PhaseGate()
+  registerTools(pi, {
+    store,
+    gate,
+    asSuppress,
+    asSupersede,
+    asRelation,
+    asAnchor,
+    writeMemory,
+    numEnv,
+    cooldownTurns,
+    linkBudget,
+    debug,
+    state,
   })
+  trace('after:registerTool')
 
   /**
    * 写入时的转存判断（`01` §4.1）。
@@ -395,7 +413,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    */
   async function judgeDoc(id: string, text: string): Promise<void> {
     if (text.length <= 180) return
-    const budget = AbortSignal.timeout(Number(process.env.AS_DOC_TIMEOUT ?? 12000))
+    const budget = AbortSignal.timeout(numEnv('AS_DOC_TIMEOUT', 12000, { min: 100, int: true }))
     const judged = await summarize(`【长内容】\n${text.slice(0, 1200)}`, DOC_RULES, budget)
     if (judged === undefined) return
     const { verdict, reason, summary } = parseDocVerdict(judged)
@@ -427,123 +445,6 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     void job.finally(() => pendingDocs.delete(job))
   }
 
-  /**
-   * 交涉通道：主 AI 唯一能主动动记忆的入口。
-   *
-   * 旁路只解析意图，**执行在代码里**（软抑制 / 取代 / 直接调出）。
-   * 拿不准就 NONE——改记忆的代价高于不改。
-   * @param say - 主 AI 的原话。
-   * @param target - 可选的目标描述。
-   * @returns 给主 AI 看的回执。
-   */
-  async function handleMemoryIntent(say: string, target?: string): Promise<string> {
-    // 交涉需要当轮回执（D7），只在阻塞相受理
-    const admission = gate.require('交涉解析')
-    if (!admission.ok) return '交涉只在回答进行中受理，稍后再试。'
-    const query = target ?? say
-    // 交涉请求是**指代**，不是检索：用户会说"住处""那个项目"，与正文常常零重叠。
-    // 所以召回不足时，直接把活跃条目摊给旁路挑——候选量有界（≤20 条短句）。
-    let candidates = store.recall(query, 6)
-    if (candidates.length < 3) {
-      const active = store.list().filter(entry => entry.state === 'active')
-      const seen = new Set(candidates.map(entry => entry.id))
-      candidates = [...candidates, ...active.filter(entry => !seen.has(entry.id))].slice(0, 20)
-    }
-    if (candidates.length === 0) return '记忆库里没有找到相关条目，没有做任何改动。'
-
-    const listed = candidates
-      .map((entry, index) => `#${index + 1} ${entry.text}`)
-      .join('\n')
-    const budget = AbortSignal.timeout(Number(process.env.AS_INTENT_TIMEOUT ?? 12000))
-    const text = await summarize(
-      [`【请求】${say}`, target === undefined ? '' : `【指向】${target}`, '', '【候选记忆】', listed].join('\n'),
-      INTENT_RULES,
-      budget,
-    )
-    if (text === undefined) return '解析服务不可用，没有做任何改动。'
-
-    const intent = parseIntent(text)
-    const picked = intent.index === undefined ? undefined : candidates[intent.index - 1]
-    if (intent.kind === 'none' || picked === undefined) {
-      // 端到端踩过（记录 29 §4.2）：模型拿到这句会转述成"记忆系统坏了、没法落库"，
-      // 而实际上下行写入走的是收尾相那条通道，压根不经过这个工具。
-      // 所以说清楚"这个工具只管三件事"，它才不会拿"没对上号"去否定整条链路。
-      return '没能在候选里对上号，没有做任何改动。这个工具只处理"忘掉 / 改写已有条目 / 建立关联"，'
-        + '不负责新增——新增是由对话本身沉淀的，不经过工具。可以对上号再说一次，或者直接继续聊，需要记得的内容会自己留下。'
-    }
-
-    let outcome = ''
-    if (intent.kind === 'forget') {
-      asSuppress.suppress(picked.id)
-      outcome = `已不再主动提起：${picked.text}`
-    } else if (intent.kind === 'revise') {
-      // 4 字下限与 REMEMBER 一致：再短就不是一条事实，而积压队列也按同一口径收
-      if (intent.text === undefined || intent.text.trim().length < 4) return '没给可用的新文本，没有改动。'
-      const replacement = writeMemory(state.sessionFile, intent.text, {
-        origin: 'human',
-        salience: 0.7,
-        reason: 'revise',
-      })
-      if (replacement === undefined) {
-        // 不受信任会话：修正进队，旧条目照旧生效（没有新条目可以取代它）。
-        // 回执只陈述"记下了"，不透露信任开关（A9：主 AI 不能感知阈值）。
-        outcome = '已记下这条修正。'
-      } else {
-        asSupersede.supersede(picked.id, replacement)
-        outcome = `已改为「${intent.text}」（旧版保留可查）`
-      }
-    } else if (intent.kind === 'remind') {
-      outcome = `调出来了：${picked.text}`
-    } else {
-      // link / unlink 需要两条：缺第二条就反问（拒绝必须附替代方案）
-      const second = intent.index2 === undefined ? undefined : candidates[intent.index2 - 1]
-      if (second === undefined) {
-        const options = candidates.slice(0, 4).map((entry, at) => `(${at + 1}) ${entry.text}`).join('；')
-        return `要关联两条，你只给了一条。候选里有这些：${options}——和哪一条？`
-      }
-      if (intent.kind === 'link') {
-        outcome = asRelation.addLink(picked.id, second.id)
-          ? `已关联，最多带出 ${linkBudget} 条：${picked.text}／${second.text}`
-          : '这两条没连上（可能指向同一条或已不存在）。'
-      } else {
-        outcome = asRelation.removeLink(picked.id, second.id)
-          ? `已解除：${picked.text}／${second.text}`
-          : '这两条本来就没有关联。'
-      }
-    }
-
-    state.pendingAudit.push({
-      type: 'custom',
-      customType: 'as/intent',
-      data: { kind: intent.kind, id: picked.id, say: say.slice(0, 80) },
-    })
-    if (debug) process.stderr.write(`[as] intent: ${intent.kind} ${picked.id}\n`)
-    return outcome
-  }
-
-  trace('before:registerTool')
-  if (process.env.AS_TOOL !== '0') pi.registerTool({
-    name: 'memory',
-    label: 'memory',
-    description:
-      '对长期记忆提出请求：忘记、修正、想起某条内容。用自然语言说你要什么，系统负责解析与执行。'
-      // 端到端踩过：模型把"记住某事"也交给这个工具，然后拿"没对上号"当成"系统坏了"。
-      + '不负责新增：需要长期留下的内容由对话本身沉淀，不用调用本工具。'
-      + '涉及身份或长期原则的修改请勿使用本工具。',
-    promptSnippet: 'memory — 请求忘记/修正/调出某条长期记忆',
-    parameters: Type.Object({
-      say: Type.String({ description: '自然语言描述你要对记忆做什么' }),
-      target: Type.Optional(Type.String({ description: '可选：指向哪条记忆（原话片段或主题）' })),
-    }),
-    async execute(_toolCallId: string, params: { say: string; target?: string }) {
-      const text = await handleMemoryIntent(params.say, params.target)
-      return { content: [{ type: 'text' as const, text }], details: {} }
-    },
-  })
-
-  trace('after:registerTool')
-
-  /** 当前会话文件——备注挂在它上面。 */
   /**
    * 会话键归一化：**绝对路径 + 正斜杠**。
    *
@@ -704,498 +605,6 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     return entry.id
   }
 
-  pi.registerCommand('as-untrust', {
-    description: '把当前会话切成不受信任（此后写入积压，不落库）',
-    handler: async (_args: string, ctx: unknown) => {
-      const sessionFile = sessionFileOf(ctx)
-      if (sessionFile === '') {
-        notify(ctx, '拿不到会话文件，信任等级没有改动。')
-        return
-      }
-      asTrust.setTrust(sessionKey(sessionFile), 'untrusted')
-      asAudit.appendAudit('as/trust', { session: sessionFile, state: 'untrusted' })
-      notify(ctx, `本会话已设为不受信任：此后本会话的写入会积压，等你看。读记忆与对话不受影响。（积压上限 ${pendingMax} 条，到线后新写入不再入队）`)
-    },
-  })
-
-  pi.registerCommand('as-trust', {
-    description: '把当前会话切回受信任（不追认积压）',
-    handler: async (_args: string, ctx: unknown) => {
-      const sessionFile = sessionFileOf(ctx)
-      if (sessionFile === '') {
-        notify(ctx, '拿不到会话文件，信任等级没有改动。')
-        return
-      }
-      asTrust.setTrust(sessionKey(sessionFile), 'trusted')
-      asAudit.appendAudit('as/trust', { session: sessionFile, state: 'trusted' })
-      notify(ctx, [
-        '本会话已切回受信任：之后的写入直接入库。',
-        '**积压不会自动批准**——用 /as-writes 看，/as-adopt <id> 逐条批，/as-dismiss <id> 弃掉；整批用 /as-adopt-all 或 /as-dismiss-all。',
-      ].join('\n'))
-    },
-  })
-
-  // 脱敏体检（记录 37 §七的残余风险）：写侧脱敏与注入前二次扫描都接了，
-  // 但**旧条目的库里仍是明文**——那是"当时写下的事实"，回溯改库等于篡改历史。
-  // 所以正确的下一步不是"偷偷改掉"，而是**先体检报给人，由人决定怎么处理**。
-  //
-  // **只读**：这个命令一个字节都不写。它报的是"哪几条还带着明文凭据"，
-  // 报出来的预览本身也是脱敏后的（绝不把凭据打到终端或日志里）。
-  pi.registerCommand('as-scrub-scan', {
-    description: '体检：列出库里仍残留明文凭据的条目（只读，不改库）',
-    handler: async (_args: string, ctx: unknown) => {
-      const entries = store.list()
-      const hits = store.scanForSecrets(
-        entries.map(entry => ({ id: entry.id, text: entry.text, summary: entry.summary })),
-      )
-      if (hits.length === 0) {
-        notify(ctx, `体检：${entries.length} 条记忆，**没有**发现明文凭据。`, 'info')
-        return
-      }
-      const byId = new Map(entries.map(entry => [entry.id, entry]))
-      const lines = hits.map(hit => {
-        const entry = byId.get(hit.id)
-        // 预览用脱敏后的文本：这条命令的输出可能进终端回滚缓冲、日志、截图
-        const preview = scrubSecrets(entry?.text ?? '').text.slice(0, 48)
-        return `${hit.id}  [${hit.kinds.join(',')}]  ${preview}`
-      })
-      notify(ctx, [
-        `体检：${entries.length} 条记忆，其中 **${hits.length} 条仍带明文凭据**（已脱敏的写入是干净的；这些是更早的存量）。`,
-        ...lines,
-        '',
-        '处置要人来做：这个命令不改库（改历史 = 篡改"当时写下的事实"）。',
-        '可选：就地抑制（/as-dismiss 走的是积压队列，对已入库条目请用 `/as-suppress <id>`）或整条删除。',
-      ].join('\n'), 'warn')
-    },
-  })
-
-  // profile 隔离（`02` B7 / `D20`）：一个 profile 一套库。
-  // **不在运行中切库**：库是单文件句柄，半途换路径会把审计链切成两段（前一段的 hash
-  // 接不上后一段的第一条），而审计是这套系统的承重墙。所以这里只做"看得见 + 怎么切"。
-  pi.registerCommand('as-profile', {
-    description: '显示当前 profile 与库路径；切换 profile 需要新起会话',
-    handler: async (args: string, ctx: unknown) => {
-      const profile = (process.env.AS_PROFILE ?? '').trim()
-      const db = process.env.AS_DB?.trim() || defaultDbPath()
-      const lines = [
-        `当前 profile：${profile === '' ? '（默认）' : profile}`,
-        `库：${db}`,
-        `条目：${store.count()} 条`,
-      ]
-      const target = args.trim()
-      if (target !== '') {
-        lines.push(
-          '',
-          `要切到「${target}」，请新起一个会话：`,
-          `AS_PROFILE=${target} AS_ENABLED=1 pi --extension ./pi/src/index.ts`,
-          '（不在运行中切：换库会把审计链切成两段，而它是对账的唯一凭据。）',
-        )
-      }
-      notify(ctx, lines.join('\n'), 'info')
-    },
-  })
-
-  pi.registerCommand('as-writes', {
-    description: '列出当前会话积压的写入（可按来源筛：user / model）',
-    handler: async (args: string, ctx: unknown) => {
-      const all = store.listPendingWrites(sessionKey(sessionFileOf(ctx)))
-      const quota = `${all.length}/${pendingMax}`
-      if (all.length === 0) {
-        notify(ctx, `无积压（当前 0/${pendingMax}）。`)
-        return
-      }
-      // 按来源筛（`01` §13 的"按会话折叠计数并提示"）：积压到几十条时人需要的是**筛**，
-      // 不是"逐条看"或"整批一键"。来源是最有用的那个维度——模型写的与用户自己说的，
-      // 风险等级不同，值得分开处置。
-      const filter = args.trim().toLowerCase()
-      const pending = filterByOrigin(all, filter)
-      if (pending.length === 0) {
-        notify(ctx, `本会话积压 ${all.length} 条（当前 ${quota}），其中来源为「${filter}」的 0 条。`)
-        return
-      }
-      const full = all.length >= pendingMax ? '——已达上限，新写入被丢弃（先批准或无视一批）' : ''
-      const breakdown = formatOriginBreakdown(countByOrigin(all))
-      const lines = pending.map(item => formatPendingLine(item))
-      notify(ctx, [
-        `本会话积压 ${all.length} 条（当前 ${quota}${full}；批准后才入库）｜按来源：${breakdown}`,
-        ...(pending.length === all.length ? [] : [`—— 下面是来源为「${filter}」的 ${pending.length} 条：`]),
-        ...lines,
-        '逐条：/as-adopt <id>、/as-dismiss <id>；整批：/as-adopt-all、/as-dismiss-all；按来源整批：/as-adopt-all user。',
-      ].join('\n'))
-    },
-  })
-
-  pi.registerCommand('as-adopt', {
-    description: '批准一条积压写入（/as-adopt <id>）',
-    handler: async (args: string, ctx: unknown) => {
-      const id = (args ?? '').trim()
-      if (id === '') {
-        notify(ctx, '要给积压 id（先用 /as-writes 看）。')
-        return
-      }
-      const entry = asTrust.adoptWrite(id)
-      if (entry === undefined) {
-        notify(ctx, `没能采纳：${id}（不存在或已处置）`)
-        return
-      }
-      asAudit.appendAudit('as/adopt', { id, entry })
-      notify(ctx, `已采纳：${id} → ${entry}`)
-    },
-  })
-
-  pi.registerCommand('as-dismiss', {
-    description: '无视一条积压写入（/as-dismiss <id>）',
-    handler: async (args: string, ctx: unknown) => {
-      const id = (args ?? '').trim()
-      if (id === '') {
-        notify(ctx, '要给积压 id（先用 /as-writes 看）。')
-        return
-      }
-      if (!asTrust.dismissWrite(id)) {
-        notify(ctx, `没能无视：${id}（不存在或已处置）`)
-        return
-      }
-      asAudit.appendAudit('as/dismiss', { id })
-      notify(ctx, `已无视：${id}（没有入库）`)
-    },
-  })
-
-  /**
-   * 整批处置：把当前会话所有 pending 一次批完（`02` §5.4-1 的"界面另给全部批准"）。
-   *
-   * **批量 ≠ 批量提权**：`adoptWrite()` 原样保留 `origin`，trust 仍由 `TRUST_BY_ORIGIN`
-   * 重新定级——`model` 来源的事件批进来还是 `model`，不会因为"人一次点了 50 条"就变成
-   * 用户事实。人点的是"这些可以进"，不是"这些升格"。所以"注入是双向的：写进去不涨权重"
-   * 这条不受影响：入库不等于提权，涨权重仍要等维护旁路判"被用上了"。
-   * 单条失败只跳过（并发/已处置），不中断整批；计数如实回报。
-   * @param adopt - true = 批准入库；false = 全部丢弃（不进库，表里留凭据）。
-   */
-  async function settleAll(ctx: unknown, adopt: boolean, originFilter = ''): Promise<void> {
-    const all = store.listPendingWrites(sessionKey(sessionFileOf(ctx)))
-    // 按来源批（`/as-adopt-all user`）：整批一键最容易变成"逃避判断"，
-    // 所以允许只批其中一类——先看 `/as-writes user` 的清单，再批。
-    const pending = filterByOrigin(all, originFilter)
-    let done = 0
-    let skipped = 0
-    for (const item of pending) {
-      const entry = adopt ? asTrust.adoptWrite(item.id) : undefined
-      const ok = adopt ? entry !== undefined : asTrust.dismissWrite(item.id)
-      if (!ok) {
-        skipped += 1
-        continue
-      }
-      done += 1
-    }
-    asAudit.appendAudit(adopt ? 'as/adopt_all' : 'as/dismiss_all', {
-      [adopt ? 'adopted' : 'dismissed']: done,
-      skipped,
-      origin: originFilter === '' ? 'all' : originFilter,
-    })
-    const verb = adopt ? '批准' : '丢弃'
-    notify(ctx, [
-      `${verb}了 ${done} 条${originFilter === '' || originFilter === 'all' ? '' : `（只处理来源「${originFilter}」）`}，跳过 ${skipped} 条（已处置或不合法）。`,
-      ...(adopt ? [] : ['丢弃的条目没有入库，表里保留凭据。']),
-      `当前积压 ${store.listPendingWrites(sessionKey(sessionFileOf(ctx))).length}/${pendingMax}。`,
-    ].join('\n'))
-  }
-
-  pi.registerCommand('as-adopt-all', {
-    description: '批准当前会话积压写入（可带来源：/as-adopt-all user）',
-    handler: async (args: string, ctx: unknown) => {
-      await settleAll(ctx, true, args.trim())
-    },
-  })
-
-  pi.registerCommand('as-dismiss-all', {
-    description: '丢弃当前会话全部积压写入（/as-dismiss-all）',
-    handler: async (args: string, ctx: unknown) => {
-      await settleAll(ctx, false, args.trim())
-    },
-  })
-
-  pi.registerCommand('as-audit', {
-    description: '查看审计链（HMAC 链）并校验完整性',
-    handler: async (_args: string, ctx: unknown) => {
-      const check = store.verifyAudit()
-      const health = check.ok
-        ? `链完整（${check.count} 条）`
-        : `⚠️ 链断裂于第 ${check.brokenAt ?? '?'} 条：${check.reason ?? '未知原因'}`
-      const rows = store.recentAudit(12).map(row => {
-        const when = new Date(row.at).toISOString().slice(5, 16).replace('T', ' ')
-        return `${String(row.seq).padStart(4)} ${when} ${row.kind.padEnd(20)} ${row.data.slice(0, 60)}`
-      })
-      notify(ctx, [`审计链：${health}`, ...rows].join('\n'), check.ok ? 'info' : 'warn')
-    },
-  })
-
-  pi.registerCommand('as-archive', {
-    description: '按时间分阶段检索归档；非日期参数按备注检索',
-    handler: async (args: string, ctx: unknown) => {
-      const key = (args ?? '').trim()
-      const refs = store.archiveRefs()
-      // 不是时间粒度 = 备注检索（与时间检索并列的另一个入口）
-      if (key !== '' && grainOf(key).grain === 'all') {
-        const counts = new Map<string, number>()
-        for (const ref of refs) counts.set(ref.sessionFile, (counts.get(ref.sessionFile) ?? 0) + 1)
-        notify(ctx, renderNoteSearch(store.listNotes(), key, counts), 'info')
-        return
-      }
-      notify(ctx, await renderArchiveView(refs, key, ref => readExcerpt(ref.sessionFile, ref.turnTs, 400)), 'info')
-    },
-  })
-
-  pi.registerCommand('as-note', {
-    description: '给当前会话加备注（不带参数则列出本会话的备注）',
-    handler: async (args: string, ctx: unknown) => {
-      const sessionFile = sessionFileOf(ctx)
-      const text = (args ?? '').trim()
-      if (text === '') {
-        const mine = store.listNotes().filter(note => note.sessionFile === sessionFile)
-        notify(ctx, mine.length === 0 ? '本会话还没有备注。' : mine.map(note => `- ${note.text}`).join('\n'), 'info')
-        return
-      }
-      const id = asTrust.addNote(sessionFile, text)
-      notify(ctx, id === undefined ? '备注没写进去（文本为空或拿不到会话文件）。' : '备注已挂在当前会话上。', 'info')
-    },
-  })
-
-  /**
-   * 大改通道：模型**只能提申请**，落地必须由人批准。
-   *
-   * 依据 `01` §7.1（change_intent + 审批 + 冷却 + 撤销窗）与 D13（审批者不看对话原文，
-   * 只看结构化反思与锚点）。这一版把"审批"落成三个命令，冷却与撤销窗见 `decideChange`。
-   * @param say - 想改什么（自然语言）。
-   * @param reason - 为什么要改（必填，服务端打时间戳，事后补不了）。
-   * @returns 给模型看的回执。
-   */
-  async function handleChangeIntent(say: string, reason: string): Promise<string> {
-    if (reason.trim().length < 10) return '申请不受理：理由太短。写清楚"为什么现在要改、不改会怎样"。'
-    const anchors = store.listAnchors()
-    if (anchors.length === 0) return '还没有任何 L1/L2 锚点，没有可改的东西。'
-
-    const listed = anchors.map((anchor, index) => `#${index + 1} [${anchor.level}] ${anchor.text}`).join('\n')
-    const budget = AbortSignal.timeout(Number(process.env.AS_INTENT_TIMEOUT ?? 12000))
-    const text = await summarize(
-      [`【想改什么】${say}`, `【为什么】${reason}`, '', '【候选锚点】', listed].join('\n'),
-      CHANGE_RULES,
-      budget,
-    )
-    if (text === undefined) return '解析服务不可用，申请没有提交。'
-
-    const intent = parseChange(text)
-    const target = intent.index === undefined ? undefined : anchors[intent.index - 1]
-    if (target === undefined || intent.newText === undefined) {
-      return '没能在锚点里对上号，申请没有提交。'
-    }
-
-    // 先落申请（只记，不落库），再交给审批旁路判。
-    const id = asAnchor.addChange({
-      kind: 'revise',
-      anchorId: target.id,
-      newText: intent.newText,
-      reason,
-      reflection: intent.reflection,
-      normalized: intent.normalized,
-    })
-    if (id === undefined) return '这条改动没能记下（新文本为空或超过 120 字）。'
-
-    // 审批旁路：**隔离上下文**——只给结构化反思、锚点新旧、历史已批准链（02 B3）
-    const judgeInput = buildApproverInput({
-      say,
-      reflection: intent.reflection ?? {},
-      oldText: target.text,
-      newText: intent.newText,
-      history: store.listChanges().filter(item => item.status === 'applied'),
-    })
-    const judgeBudget = AbortSignal.timeout(Number(process.env.AS_APPROVER_TIMEOUT ?? 15000))
-    const judged = await summarize(judgeInput, APPROVER_PROMPT, judgeBudget)
-    const verdict = judged === undefined
-      ? { verdict: 'clarify' as const, reason: '审批者不可用' }
-      : parseVerdict(judged)
-
-    const cooldown = verdict.risk === 'major'
-      ? Number(process.env.AS_CHANGE_COOLDOWN_MIN ?? 10) * 60_000
-      : 0
-    const turnNow = Number(store.getMeta('turn_total') ?? 0)
-    asAnchor.judgeChange(id, verdict.verdict, verdict.reason, {
-      risk: verdict.risk,
-      applyAt: verdict.verdict === 'approve' ? Date.now() + cooldown : 0,
-      applyTurn: verdict.verdict === 'approve' ? turnNow + cooldownTurns : 0,
-    })
-
-    state.pendingAudit.push({
-      type: 'custom',
-      customType: 'as/change',
-      data: {
-        id,
-        verdict: verdict.verdict,
-        risk: verdict.risk ?? null,
-        reason: verdict.reason,
-        normalized: verdict.normalized ?? intent.normalized ?? '',
-      },
-    })
-
-    // 回执保持中性：主 AI 不该知道审批机制存在（A5 / A10）
-    if (verdict.verdict === 'approve') return '好，按这个设定调整了。'
-    if (verdict.verdict === 'reject') return '这条改动没有通过。'
-    return '这条改动还需要更清楚的依据，先放着。'
-  }
-
-  pi.registerTool({
-    name: 'change',
-    label: 'change',
-    description:
-      '申请修改自己的长期设定（L1/L2 锚点）。**只是申请**：要人批准才生效。'
-      + '一次只能改一条，必须写清理由。',
-    parameters: Type.Object({
-      say: Type.String({ description: '想改成什么（自然语言）' }),
-      reason: Type.String({ description: '为什么现在要改、不改会怎样（必填，≥10 字）' }),
-    }),
-    async execute(_toolCallId: string, params: { say: string; reason: string }) {
-      const text = await handleChangeIntent(params.say, params.reason)
-      return { content: [{ type: 'text' as const, text }], details: {} }
-    },
-  })
-
-  pi.registerCommand('as-pending', {
-    description: '看待批的大改申请（只看锚点与结构化反思，不看对话原文）',
-    handler: async (_args: string, ctx: unknown) => {
-      const pending = store.listChanges('pending')
-      if (pending.length === 0) {
-        notify(ctx, '没有待批的申请。', 'info')
-        return
-      }
-      const lines = pending.map(item => {
-        const wait = item.applyAt > Date.now()
-          ? `冷却中，还需 ${Math.ceil((item.applyAt - Date.now()) / 60_000)} 分钟`
-          : '可裁决'
-        const reflection = Object.entries(item.reflection)
-          .map(([key, value]) => `    ${key}: ${value}`)
-          .join('\n')
-        return [
-          `${item.id}｜${item.risk}｜${wait}`,
-          `  锚点 ${item.anchorId}：「${item.oldText}」→「${item.newText}」`,
-          `  理由：${item.reason}`,
-          reflection === '' ? '' : `  结构化反思：\n${reflection}`,
-          item.normalized === '' ? '' : `  标准化：${item.normalized}`,
-        ].filter(line => line !== '').join('\n')
-      })
-      notify(ctx, [`待批 ${pending.length} 条：`, ...lines].join('\n'), 'info')
-    },
-  })
-
-  for (const [name, decision, label] of [
-    ['as-approve', 'approve', '批准'],
-    ['as-reject', 'reject', '驳回'],
-    ['as-revoke', 'revoke', '撤销'],
-  ] as const) {
-    pi.registerCommand(name, {
-      description: `${label}一条大改申请`,
-      handler: async (args: string, ctx: unknown) => {
-        const id = (args ?? '').trim()
-        if (id === '') {
-          notify(ctx, '要给申请 id（先用 /as-pending 看）。', 'info')
-          return
-        }
-        const ok = asAnchor.decideChange(id, decision)
-        notify(ctx, ok ? `已${label}：${id}` : `没能${label}：${id}（不存在或状态不对）`, 'info')
-      },
-    })
-  }
-
-  pi.registerTool({
-    name: 'archive',
-    label: 'archive',
-    description:
-      '查看被移出上下文的归档。两种查法：给 q 按内容找情景摘要（先轻后重）；'
-      + '按时间则是分阶段的：不给 key 返回"哪几年有结果"，'
-      + '给 2026 返回月份，给 2026-10 返回周，给 2026-W44 返回天，给 2026-10-26 返回时，'
-      + '给 2026-10-26T14 才给片段；命中过少时会直接给片段。',
-    parameters: Type.Object({
-      key: Type.Optional(Type.String({ description: '时间粒度：2026 / 2026-10 / 2026-W44 / 2026-10-26 / 2026-10-26T14' })),
-      q: Type.Optional(Type.String({ description: '线索（人话）：按内容找回情景摘要，比如"缓存那次讨论"' })),
-    }),
-    async execute(_toolCallId: string, params: { key?: string; q?: string }) {
-      const admission = gate.require('归档')
-      if (!admission.ok) {
-        return { content: [{ type: 'text' as const, text: '现在不查归档，等这一轮结束后再说。' }], details: {} }
-      }
-      const refs = store.archiveRefs()
-      // 只读也要留痕：事后能看出模型查了什么（D2 修订里的三条约束之一）
-      state.pendingAudit.push({
-        type: 'custom',
-        customType: 'as/archive_query',
-        data: { key: params.key ?? '', q: params.q ?? '', refs: refs.length },
-      })
-
-      // R2：按线索取回情景摘要（细节模糊但索引在时走这一级）
-      if (params.q !== undefined && params.q.trim() !== '') {
-        // R2 的配套纪律：同一轮里 `q` 最多 2 次（`03` §3；记录 22 的遗留项）。
-        // 为什么要有这个刹车：`key` 那条路天然分阶段（给年份不给片段），而 `q` 是按内容找，
-        // 反复问就能一轮轮把摘要捞成"索引的索引"。两次够澄清用了，第三次起请改走时间下钻。
-        if (state.archiveQueriesTurn !== state.userTurns) {
-          state.archiveQueriesTurn = state.userTurns
-          state.archiveQueries = 0
-        }
-        const maxQueries = 2
-        if (state.archiveQueries >= maxQueries) {
-          state.pendingAudit.push({
-            type: 'custom',
-            customType: 'as/archive_query',
-            data: { key: '', q: params.q, refs: refs.length, rejected: true, reason: 'rate' },
-          })
-          return {
-            content: [{
-              type: 'text' as const,
-              text: '这一轮里我已经按线索查过两次了。先按时间下钻吧：给 2026 / 2026-10 / 2026-W44 / 2026-10-26 这类粒度，'
-                + '命中过少时会直接给片段。需要的话下一轮再按线索查。',
-            }],
-            details: {},
-          }
-        }
-        state.archiveQueries += 1
-        const hits = store.searchArchive(params.q, 3)
-        if (hits.length === 0) {
-          // R5 与 R4 的分界：**根本没有归档**时不该反问线索——反问会让模型以为
-          // "再给点线索就能查到"，从而把没发生过的事说得像发生过。
-          if (refs.length === 0) {
-            return {
-              content: [{ type: 'text' as const, text: unrecoverable('empty-archive', '所以没有摘要可查') }],
-              details: {},
-            }
-          }
-          // 先澄清后猜测（03 §3 的原则）：问时间/人名/关键词，而不是硬猜一段。
-          // 末句是 R3 的入口提示：命中 0 不等于"没有"，按时间下钻是另一条腿。
-          return {
-            content: [{
-              type: 'text' as const,
-              text: '没找到沾边的摘要。给我更具体的线索（大概哪段时间、跟谁或哪个项目有关、说过什么词），我再查一次；也可能这段当时没留下摘要。如果你确定说过，我可以按时间下钻（给 2026 / 2026-10 / 2026-W44 / 2026-10-26 这类粒度）。',
-            }],
-            details: {},
-          }
-        }
-        const lines = hits.map(hit => {
-          const when = new Date(hit.turnTs).toISOString().slice(0, 16).replace('T', ' ')
-          return `[${when}] ${hit.title}\n  ${hit.summary.slice(0, 300)}`
-        })
-        return {
-          content: [{
-            type: 'text' as const,
-            text: ['这是摘要，不是原话：', ...lines, '', '要某一条的原文，用时间粒度（key）下钻到那一段。'].join('\n'),
-          }],
-          details: {},
-        }
-      }
-
-      const text = await renderArchiveView(
-        refs,
-        params.key ?? '',
-        ref => readExcerpt(ref.sessionFile, ref.turnTs, 400),
-      )
-      return { content: [{ type: 'text' as const, text }], details: {} }
-    },
-  })
-
   /** 压缩指令：把"不能丢"的东西点名给摘要器，而不是让它自己猜。 */
   function compactInstructions(): string {
     const keep = store.list()
@@ -1243,7 +652,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
         continue
       }
       batches += 1
-      const budget = AbortSignal.timeout(Number(process.env.AS_SUMMARY_TIMEOUT ?? 15000))
+      const budget = AbortSignal.timeout(numEnv('AS_SUMMARY_TIMEOUT', 15000, { min: 100, int: true }))
       const text = await summarize(
         renderBatch(messages, batch),
         `${TURN_RULES}\n\n本批共 ${batch.length} 轮。`,
@@ -1361,7 +770,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     // 但计划块还有内容特征兜底（`turns.ts` 的 PLAN_SIGNATURE）。
     markProtected(block, 'plan')
 
-    const index = messages.findIndex(message => JSON.stringify(message).includes(PLAN_MARK))
+    const index = messages.findIndex(message => plainText(message).startsWith(PLAN_MARK))
     if (index < 0) return [block, ...messages]
     const copy = [...messages]
     copy[index] = block
@@ -1403,25 +812,19 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const redacted = applyRedactions(viewAfterAnchors, store.redactions(sessionFileOf(ctx)))
     // 剔除相关的标记必须打在**剔除之后**（applyRedactions 会重建被改动的消息）。
     if (redacted.hits > 0) {
-      for (let index = 0; index < redacted.messages.length; index += 1) {
-        const before = viewAfterAnchors[index]
-        if (JSON.stringify(redacted.messages[index]) !== JSON.stringify(before)) {
-          markProtected(redacted.messages[index], 'redaction')
-        }
+      for (const index of redacted.touchedIndices) {
+        markProtected(redacted.messages[index], 'redaction')
       }
-    }
-    if (redacted.hits > 0) {
       state.pendingAudit.push({
         type: 'custom',
         customType: 'as/redaction_view',
         data: { hits: redacted.hits },
       })
-      return { messages: redacted.messages as never[] }
     }
-    if (anchored !== undefined) return { messages: anchored as never[] }
 
-    const withPlanOrUndefined = (): { messages: never[] } | undefined =>
-      planned === undefined ? undefined : { messages: redacted.messages as never[] }
+    const viewChanged = planned !== undefined || anchored !== undefined || redacted.hits > 0
+    const baseViewOrUndefined = (): { messages: never[] } | undefined =>
+      viewChanged ? { messages: redacted.messages as never[] } : undefined
 
     // 调试行：这次请求的视图里到底有没有不可移出区。
     // 有了它，"计划块不见了"这类问题能被一眼定位，而不是靠模型转述去猜。
@@ -1489,7 +892,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       // 读数在、线以下 → 解冻。读不到用量时**不动**状态：缺数据不改变判断。
       state.frozen = false
     }
-    if (usage === undefined || typeof usage.tokens !== 'number') return withPlanOrUndefined()
+    if (usage === undefined || typeof usage.tokens !== 'number') return baseViewOrUndefined()
     const usable = Math.max(1, usage.contextWindow - reserve)
     state.pressure = usage.tokens / usable
     state.tokens = usage.tokens
@@ -1511,7 +914,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     // 单 turn 内膨胀时，pi 的压缩动不了（它按 turn 边界切，切不出东西）。
     // 这里由我们自己压：先让旁路模型把较早的部分写成「按轮纪要」，
     // 失败则退回确定性折叠（只留一行索引）。两者都只改发给模型的那一份。
-    if (state.pressure < foldAt) return withPlanOrUndefined()
+    if (state.pressure < foldAt) return baseViewOrUndefined()
     const messages = redacted.messages as unknown[]
     const roleOf = (index: number): string | undefined => (messages[index] as { role?: string }).role
     const toolIndexes = messages
@@ -1519,7 +922,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       .filter(index => index >= 0)
     // 这几条以前是 `return undefined`：宿主会沿用原消息，于是**只存在于视图里的计划块
     // 整个消失**（记录 39 §1.3）。改成返回视图——压力再大也不许让不可移出区掉出去。
-    if (toolIndexes.length <= foldKeep) return withPlanOrUndefined()
+    if (toolIndexes.length <= foldKeep) return baseViewOrUndefined()
 
     // 保留最后 foldKeep 条工具结果。
     // 切点规则（踩过 400 才定下来的）：
@@ -1534,19 +937,19 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       return -1
     }
     const owner = lastAssistantBefore(cutoff)
-    if (owner <= 0) return withPlanOrUndefined()
+    if (owner <= 0) return baseViewOrUndefined()
     const dropEnd = owner
     const foldStart = lastAssistantBefore(owner)
-    if (foldStart <= 0) return withPlanOrUndefined()
+    if (foldStart <= 0) return baseViewOrUndefined()
     const old = messages.slice(foldStart, dropEnd)
-    if (old.length === 0) return withPlanOrUndefined()
+    if (old.length === 0) return baseViewOrUndefined()
 
     // 区域没变就复用上一份纪要，避免每次请求都重算
-    const signature = old.map(message => JSON.stringify(message).length).join(',')
+    const signature = createHash('sha256').update(JSON.stringify(old)).digest('hex')
     if (state.digestSignature !== signature) {
       const userTurns = old.filter(message => (message as { role?: string }).role === 'user').length
       const tools = old.filter(message => (message as { role?: string }).role === 'toolResult').length
-      const budget = AbortSignal.timeout(Number(process.env.AS_SUMMARY_TIMEOUT ?? 15000))
+      const budget = AbortSignal.timeout(numEnv('AS_SUMMARY_TIMEOUT', 15000, { min: 100, int: true }))
       const signal = ctx.signal === undefined ? budget : AbortSignal.any([ctx.signal, budget])
       const text = await summarize(renderTranscript(old), choosePrompt(tools, userTurns), signal)
       if (text !== undefined) {
@@ -1574,7 +977,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
 
     if (digest === undefined) {
       const next = [...prefix, ...regionKeep, ...suffix]
-      if (folded === 0) return withPlanOrUndefined()
+      if (folded === 0) return baseViewOrUndefined()
       // 「已移出可恢复」：占位里已经写了"可按时间检索"，
       // 那**指针就得真的在库里**——否则模型照着指引去检索却捞不到（记录 43 §2）。
       writeRecoveryRefs(foldSignals, 'fold', sessionFile)
@@ -1654,13 +1057,6 @@ export default function authenticSelf(pi: ExtensionAPI): void {
    * 三件事同时机（都在 turn 结束后）、都不阻塞、共享同一份上下文——
    * 这正是"能合"的那一对（见 `01` §5.5：上行与下行不能合，但它们可以）。
    */
-  const gate = new PhaseGate()
-  let pendingWrapup: Promise<void> | undefined
-  // 写入时的转存判断是 fire-and-forget（不阻塞对话）；但 `pi -p` 会在 turn 结束后
-  // 立刻退出，没人等的 promise 会被直接砍掉——实测：187 字的长条目写进去了，
-  // doc_verdict 与 summary 却都是空的。所以这里留句柄，关库前统一等一次。
-  const pendingDocs = new Set<Promise<void>>()
-
   async function runWrapup(answer: string, userSaid: string): Promise<void> {
     const sediment = gate.require('沉淀')
     if (!sediment.ok) {
@@ -1689,7 +1085,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       pool.length > 0 ? pool.map((entry, index) => `#${index + 1} ${entry.text}`).join('\n') : '（无）',
     ].join('\n')
 
-    const budget = AbortSignal.timeout(Number(process.env.AS_WRAPUP_TIMEOUT ?? 15000))
+    const budget = AbortSignal.timeout(numEnv('AS_WRAPUP_TIMEOUT', 15000, { min: 100, int: true }))
     const text = await summarize(transcript, WRAPUP_RULES, budget)
     if (text === undefined) return
     const result = parseWrapup(text)
@@ -1741,17 +1137,6 @@ export default function authenticSelf(pi: ExtensionAPI): void {
   // agent_start = 用户一轮的开始。
   // 轮次簿记放这里而不是 message_end(user)：实测 message_end 在 settle 之后才触发，
   // 用它当"轮开始"信号会让检索相被相位门拒绝（迟到一轮）。
-  pi.on('session_start', async () => {
-    const check = store.verifyAudit()
-    if (!check.ok) {
-      // 不阻断使用：链断了是"证据被动过"，不是"系统不能跑"
-      process.stderr.write(`[as] 审计链断裂于第 ${check.brokenAt ?? '?'} 条：${check.reason ?? '未知原因'}\n`)
-      asAudit.appendAudit('as/audit_broken', { brokenAt: check.brokenAt ?? 0, reason: check.reason ?? '', count: check.count })
-      return
-    }
-    asAudit.appendAudit('as/session_start', { auditCount: check.count, l0: l0Digest() })
-  })
-
   pi.on('agent_start', async () => {
     // 注入续步会再开一圈 agent 循环：它仍是同一轮，相位保持阻塞，不重开轮次
     if (state.continueScheduled) {
@@ -1772,17 +1157,11 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const messages = (event as { messages?: { role?: string; content?: unknown }[] }).messages ?? []
     const answer = messages
       .filter(item => item.role === 'assistant')
-      .map(item => Array.isArray(item.content)
-        ? item.content.map(block => String((block as { text?: string }).text ?? '')).join('')
-        : '')
+      .map(item => extractText(item.content, ''))
       .join('\n')
     state.lastAnswer = answer
     const lastUser = [...messages].reverse().find(item => item.role === 'user')
-    const userSaid = typeof lastUser?.content === 'string'
-      ? lastUser.content
-      : Array.isArray(lastUser?.content)
-        ? lastUser.content.map(block => String((block as { text?: string }).text ?? '')).join('')
-        : ''
+    const userSaid = extractText(lastUser?.content, '')
 
     // 注入续步的循环结束 ≠ turn 结束：回到阻塞相等下一个循环（或真正的 turn 末）
     if (state.continueScheduled) {
@@ -1863,11 +1242,11 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       tagPaths.length > 0 ? tagPaths.slice(0, 60).join('、') : '（空）',
     ].join('\n')
 
-    const budget = AbortSignal.timeout(Number(process.env.AS_MAINT_TIMEOUT ?? 20000))
+    const budget = AbortSignal.timeout(numEnv('AS_MAINT_TIMEOUT', 20000, { min: 100, int: true }))
     const text = await summarize(transcript, MAINTENANCE_RULES, budget)
     if (text === undefined) return undefined
 
-    const { marks, tags, tagOps, remembers, relations } = parseMaintenance(text)
+    const { marks, tags, tagOps, remembers, relations, entities } = parseMaintenance(text)
     // 判用已挪到 turn 末的收尾调用（每轮一次，比这里每 N 轮更及时）
     let used = 0
     // 不受信任 = 可读不可写（02 §5.3）：下面三类改的是共享的记忆/标签结构，
@@ -1905,6 +1284,15 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     for (const path of writable ? tags : []) {
       if (asRelation.ensureTag(path) !== undefined) tagged += 1
     }
+    // 索引化提案（records/38）：维护旁路只产出 proposed，待人 `/as-facet approve` 升格
+    let faceted = 0
+    for (const prop of writable ? entities : []) {
+      const target = listed[prop.entry - 1]
+      if (target === undefined) continue
+      if (asRelation.addFacet(target.id, { kind: 'entity', value: prop.value, origin: 'maintenance' }) !== undefined) {
+        faceted += 1
+      }
+    }
 
     // 世界树整理：合并同义、上提空枝。放在写记忆之前，免得刚写进去的又被搬走
     let tagMoved = 0
@@ -1937,12 +1325,12 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     const overflowed = state.overflowDropped
     state.overflowDropped = 0
 
-    if (marked === 0 && tagged === 0 && remembered === 0 && related === 0 && used === 0 && queued === 0 && overflowed === 0) return undefined
-    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, tag ${tagged}, remember ${remembered}, queued ${queued}, overflowed ${overflowed}, relate ${related}, used ${used}/${injected.length}\n`)
+    if (marked === 0 && tagged === 0 && remembered === 0 && related === 0 && faceted === 0 && used === 0 && queued === 0 && overflowed === 0) return undefined
+    if (debug) process.stderr.write(`[as] maintain: mark ${marked}, tag ${tagged}, facet ${faceted}, remember ${remembered}, queued ${queued}, overflowed ${overflowed}, relate ${related}, used ${used}/${injected.length}\n`)
     return {
       type: 'custom',
       customType: 'as/maint',
-      data: { marked, tagged, remembered, queued, overflowed, related, tagMoved, used, window: window.length },
+      data: { marked, tagged, faceted, remembered, queued, overflowed, related, tagMoved, used, window: window.length },
     }
   }
 
@@ -1985,14 +1373,13 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     current: Slot[],
     ctx: unknown,
     audit: unknown[],
-  ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown; steps: number[] }> {
+  ): Promise<{ slots: Slot[]; droppedIds: string[]; audit: unknown; steps: number[] } | undefined> {
     // 相位门：检索只属于阻塞相（代码强制，不靠自觉）
     const admission = gate.require('检索')
     if (!admission.ok) {
       if (debug) process.stderr.write(`[as] memory: 检索被相位门拒绝（${admission.reason}）\n`)
-      return undefined as never
+      return undefined
     }
-    const listed = store.list().filter(entry => entry.state === 'active').slice(0, maintMemoryWindow)
     // 判用对象：**上一轮**注入的条目（它们的回答已经在上下文里，判得准）
     const injected = store.pendingInjections(10)
     const candidates: import('./memory').Candidate[] = current.map(slot => ({
@@ -2023,7 +1410,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       renderTagTree(store.tagUsage()),
     ].join('\n')
 
-    const budget = AbortSignal.timeout(Number(process.env.AS_REALTIME_TIMEOUT ?? 12000))
+    const budget = AbortSignal.timeout(numEnv('AS_REALTIME_TIMEOUT', 12000, { min: 100, int: true }))
     const text = await summarize(transcript, MEMORY_RULES, budget)
     if (text === undefined) {
       // **直注已移除**：旁路不可用 = 本轮无注入。宁可哑火，不可错注。
@@ -2237,62 +1624,62 @@ export default function authenticSelf(pi: ExtensionAPI): void {
     }
 
     let slots: Slot[] = injectable.map((entry, index) => ({ entry, index: index + 1, text: entry.text }))
-    // 本步旁路报上来的"第 k 步做完了"，等计划落库之后再执行
     let doneSteps: number[] = []
 
-    if (canInject && realtimeOn) {  // 开关沿用 AS_REALTIME，语义=阶段一开关
-      const result = await runMemoryBypass(cue.text, slots, ctx, audit)
-      if (result === undefined) {
-        // 被相位门拒绝：本步不注入，对话继续（错注的代价大于漏注）
+    const planFile = sessionFileOf(ctx)
+    const lastUserText = [...contextMessages].reverse()
+      .flatMap(message => (message as { role?: string }).role === 'user'
+        ? [(message as { content?: unknown }).content]
+        : [])
+      .map(content => extractText(content, ''))
+      .find(text => text !== '') ?? ''
+    const planSeed = (cue?.text ?? '') + '\n' + lastUserText
+    const shouldPlan = state.rounds === 0 && store.getPlan(sessionKey(planFile)) === undefined && looksComplex(planSeed)
+    const planAdmission = shouldPlan ? gate.require('判用') : { ok: false }
+    if (debug) process.stderr.write(`[as] plan: rounds=${state.rounds} seedLen=${planSeed.length} complex=${looksComplex(planSeed)}\n`)
+
+    // P2-D：当本步既需要记忆旁路、又需要立计划预筛时并发调出，避免阻塞相连续串行放大首响延迟
+    const bypassJob = canInject && realtimeOn
+      ? runMemoryBypass(cue.text, slots, ctx, audit)
+      : Promise.resolve(undefined)
+    const planJob = shouldPlan && planAdmission.ok
+      ? summarize(
+          planSeed.slice(0, 1200),
+          PLAN_RULES,
+          AbortSignal.timeout(numEnv('AS_PLAN_TIMEOUT', 15000, { min: 100, int: true })),
+        )
+      : Promise.resolve(undefined)
+
+    const [bypassResult, planDecided] = await Promise.all([bypassJob, planJob])
+
+    if (canInject && realtimeOn) {
+      if (bypassResult === undefined) {
         audit.push({
           type: 'custom',
           customType: 'as/memory',
           data: { skipped: true, reason: gate.violation() },
         })
       } else {
-        slots = result.slots
-        doneSteps = result.steps
-      // 被 DROP 的条目在本句内不得再回来（否则下一轮召回又会捞起来）
-        for (const id of result.droppedIds) state.dropped.add(id)
-        audit.push(result.audit)
+        slots = bypassResult.slots
+        doneSteps = bypassResult.steps
+        for (const id of bypassResult.droppedIds) state.dropped.add(id)
+        audit.push(bypassResult.audit)
       }
     } else if (canInject) {
-      // 显式关闭实时旁路 = 显式关闭注入（没有直注可退）
       slots = []
     }
 
-    // 计划区（03 §1 / source §5.3）：复杂请求必须先有计划。
-    // 与注入决策分开：实测注入旁路在没有候选时会返回"（无输出）"，把计划并进去会一起丢。
-    const planFile = sessionFileOf(ctx)
-    // cue 可能为空（模型没吐思考）；退回本轮最后一条用户消息
-    const lastUserText = [...contextMessages].reverse()
-      .flatMap(message => (message as { role?: string }).role === 'user'
-        ? [(message as { content?: unknown }).content]
-        : [])
-      .map(content => typeof content === 'string'
-        ? content
-        : Array.isArray(content)
-          ? content.map(block => String((block as { text?: string }).text ?? '')).join('')
-          : '')
-      .find(text => text !== '') ?? ''
-    const planSeed = (cue?.text ?? '') + '\n' + lastUserText
-    if (debug) process.stderr.write(`[as] plan: rounds=${state.rounds} seedLen=${planSeed.length} complex=${looksComplex(planSeed)}\n`)
-    if (state.rounds === 0 && store.getPlan(sessionKey(planFile)) === undefined && looksComplex(planSeed)) {
-      const admission = gate.require('判用')
-      if (admission.ok) {
-        const budget = AbortSignal.timeout(Number(process.env.AS_PLAN_TIMEOUT ?? 15000))
-        const decided = await summarize(planSeed.slice(0, 1200), PLAN_RULES, budget)
-        const plan = decided === undefined ? undefined : parsePlan(decided)
-        if (plan !== undefined && asPlan.savePlan(sessionKey(planFile), plan.goal, plan.steps, plan.openQuestions)) {
-          audit.push({
-            type: 'custom',
-            customType: 'as/plan',
-            data: { action: 'created', goal: plan.goal, steps: plan.steps.length },
-          })
-          if (debug) process.stderr.write(`[as] plan: 立计划「${plan.goal}」${plan.steps.length} 步\n`)
-        } else if (debug) {
-          process.stderr.write(`[as] plan: 预筛通过但未立计划（${decided === undefined ? '旁路不可用' : decided.slice(0, 40)}）\n`)
-        }
+    if (shouldPlan && planAdmission.ok) {
+      const plan = planDecided === undefined ? undefined : parsePlan(planDecided)
+      if (plan !== undefined && asPlan.savePlan(sessionKey(planFile), plan.goal, plan.steps, plan.openQuestions)) {
+        audit.push({
+          type: 'custom',
+          customType: 'as/plan',
+          data: { action: 'created', goal: plan.goal, steps: plan.steps.length },
+        })
+        if (debug) process.stderr.write(`[as] plan: 立计划「${plan.goal}」${plan.steps.length} 步\n`)
+      } else if (debug) {
+        process.stderr.write(`[as] plan: 预筛通过但未立计划（${planDecided === undefined ? '旁路不可用' : planDecided.slice(0, 40)}）\n`)
       }
     }
 
@@ -2332,7 +1719,7 @@ export default function authenticSelf(pi: ExtensionAPI): void {
       const listed = longOnes
         .map((entry, at) => `#${at + 1}「${entry.text.slice(0, 800)}」${entry.text.length > 800 ? '…' : ''}`)
         .join('\n\n')
-      const budget = AbortSignal.timeout(Number(process.env.AS_DIGEST_TIMEOUT ?? 15000))
+      const budget = AbortSignal.timeout(numEnv('AS_DIGEST_TIMEOUT', 15000, { min: 100, int: true }))
       const decided = await summarize(
         [`【本轮线索】${cueText.slice(0, 400)}`, '', '【待裁决的长记忆】', listed].join('\n'),
         DIGEST_RULES,

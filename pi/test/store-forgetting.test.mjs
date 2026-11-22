@@ -21,7 +21,7 @@ function read(store, sql, ...args) {
 
 // ── 1. 抑制不跨联想 ──────────────────────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const a = s.add('用户住在杭州', { origin: 'user' })
   const b = s.add('用户公司在滨江', { origin: 'user' })
   s.addLink(a.id, b.id)
@@ -43,7 +43,7 @@ function read(store, sql, ...args) {
 
 // ── 2. 降权递减 ─────────────────────────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const old = s.add('四十天没被用过的旧事', { origin: 'user', salience: 0.9 })
   const pinned = s.add('用户明确要求记住的事', { origin: 'user', salience: 0.9 })
   const low = s.add('本来就快到下限的弱条目', { origin: 'model', salience: 0.16 })
@@ -95,7 +95,7 @@ function read(store, sql, ...args) {
 
 // ── 3. 幂等闸 ───────────────────────────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const old = s.add('很久没用的条目', { origin: 'user', salience: 0.9 })
   raw(s, 'UPDATE memory_entry SET t_start = ? WHERE id = ?', Date.now() - 40 * DAY, old.id)
 
@@ -116,7 +116,7 @@ function read(store, sql, ...args) {
 
 // ── 4. summary ──────────────────────────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const e = s.add('一条需要摘要的长记忆', { origin: 'user' })
   check('4a 新条目 summary 是空串', e.summary === '')
   check('4b setSummary 命中', s.setSummary(e.id, '  关于摘要的一句话  ') === true)
@@ -170,7 +170,7 @@ function read(store, sql, ...args) {
   old.prepare("INSERT INTO memory_entry (id, kind, text, span, origin, trust, t_start) VALUES ('m-old', 'fact', '旧库里的条目', 'short', 'user', 0.9, ?)").run(Date.now())
   old.close()
 
-  const s = new Store(file)
+  const s = new Store(file, { strict: false })
   const migrated = s.list().find(item => item.id === 'm-old')
   check('5a 老库迁移后能读到旧条目、summary 为空串', migrated !== undefined && migrated.summary === '', `summary="${migrated?.summary}"`)
   check('5b 迁移后 setSummary 可用', s.setSummary('m-old', '迁移后写的摘要') === true

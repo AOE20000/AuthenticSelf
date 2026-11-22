@@ -103,7 +103,7 @@ const T2 = Date.UTC(2026, 10, 18, 2, 0, 0)
 // 中间任何一环漏掉 `state`，前面 7 组全绿而功能是死的。
 {
   const { Store } = await import('../src/store.ts')
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.ensureTag('记忆/用户')
   s.ensureTag('记忆/用户/城市')
   const old = s.add('用户住在上海静安区', { origin: 'user', tagPath: '记忆/用户/城市' })

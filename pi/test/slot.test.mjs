@@ -33,7 +33,7 @@ function seed(store) {
 
 // ── 1. 同槽写两次：旧的被取代，新的 active，总数 +2（不删）──────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   seed(s)
   const first = s.addInSlot('用户的项目叫 Halcyon，缓存层用进程内 LRU', { origin: 'user', salience: 0.8, tagPath: '项目/Halcyon' })
   const second = s.addInSlot('项目名 Halcyon，缓存层用进程内 LRU', { origin: 'user', salience: 0.6, tagPath: SLOT })
@@ -52,7 +52,7 @@ function seed(store) {
 
 // ── 2. recall：该槽只出新值（默认与 latestOnly 都一样）──────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   seed(s)
   const old = s.addInSlot('用户的项目叫 Halcyon，缓存层用进程内 LRU', { origin: 'user', salience: 0.9, tagPath: SLOT })
   const fresh = s.addInSlot('项目名 Halcyon，缓存层用进程内 LRU', { origin: 'user', salience: 0.6, tagPath: SLOT })
@@ -71,7 +71,7 @@ function seed(store) {
 
 // ── 3. 不同槽互不影响：各自留自己的现值 ─────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   seed(s)
   s.ensureTag('记忆/项目/Aether')
   const a1 = s.addInSlot('项目 Aether 用 Postgres', { origin: 'user', tagPath: '项目/Aether' })
@@ -92,7 +92,7 @@ function seed(store) {
 
 // ── 4. AS_SLOT=keep：退回并列（开关生效）────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   seed(s)
   process.env.AS_SLOT = 'keep'
   const first = s.addInSlot('同一个槽的第一种说法', { origin: 'user', tagPath: SLOT })
@@ -111,7 +111,7 @@ function seed(store) {
 
 // ── 5. activeInSlot 的边界：空槽、被取代的不算现值 ──────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   seed(s)
   check('5a 空槽返回 undefined', s.activeInSlot('记忆/项目/Halcyon') === undefined,
     `got=${s.activeInSlot('记忆/项目/Halcyon')?.id}`)
@@ -152,7 +152,7 @@ function seed(store) {
 
 // ── 7. 不受信任会话：写入不落库，槽里现值不被取代 ───────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   seed(s)
   const current = s.addInSlot('用户的项目叫 Halcyon，缓存层用进程内 LRU', { origin: 'user', tagPath: SLOT })
   s.setTrust('sess-u', 'untrusted')
@@ -176,7 +176,7 @@ function seed(store) {
 
 // ── 8. 兜底桶「其他」不是槽：无关的事不许互相取代 ───────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.ensureTag('记忆/其他')
   const a = s.addInSlot('用户每周三下午开周会', { origin: 'user', tagPath: '其他' })
   const b = s.addInSlot('用户的猫叫团子', { origin: 'user', tagPath: '记忆/其他' })
@@ -192,7 +192,7 @@ function seed(store) {
 // 但它把"这个位置以前是什么"一并挡掉了——而时间线最该给模型的就是这个。
 // 开关放开一条缝，但必须**有缝就有限制**，否则候选池会被历史挤爆。
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.ensureTag('记忆/用户')
   s.ensureTag('记忆/用户/城市')
   const v1 = s.add('用户住在上海静安区', { origin: 'user', tagPath: '记忆/用户/城市' })
@@ -220,6 +220,32 @@ function seed(store) {
   const withHistory = s.recall('静安区', 10, new Set(), { history: true })
   check('9g 同槽现值没入围时，history 不额外带旧值',
     withHistory.length === withoutHistory.length, `with=${withHistory.length} without=${withoutHistory.length}`)
+  s.close()
+}
+
+// ── 10. 召回大小写无关、不误撞 id、busy_timeout 已设 ───────────────────────
+{
+  const s = new Store(':memory:', { strict: false })
+  s.ensureTag('记忆/技术')
+  s.ensureTag('记忆/技术/Redis')
+  const sql = s.addInSlot('后端主存储迁移到 SQLite WAL 模式', { origin: 'user', tagPath: '记忆/技术/SQLite' })
+  const cache = s.addInSlot('会话缓存采用内存结构', { origin: 'user', tagPath: '记忆/技术/Redis' })
+
+  const hitText = s.recall('sqlite wal 配置如何', 5)
+  check('10a 英文小写检索命中正文混合大小写 SQLite', hitText.some(item => item.id === sql.entry.id), `n=${hitText.length}`)
+
+  const hitTag = s.recall('redis 缓存怎么用', 5)
+  check('10b 英文小写线索命中混合大小写标签 Redis', hitTag.some(item => item.id === cache.entry.id), `n=${hitTag.length}`)
+
+  // 构造一条正文与线索零重叠但 cue 刻意含条目 id 前缀片段的查询，验证不误命中
+  const idSuffix = sql.entry.id.slice(-4)
+  const falseCue = `无关文本xyz_${idSuffix}`
+  const byIdOnly = s.recall(falseCue, 5)
+  check('10c recall 不拼 row.id 参与二元组匹配', !byIdOnly.some(item => item.id === sql.entry.id), `n=${byIdOnly.length}`)
+
+  const timeoutRow = s.db.prepare('PRAGMA busy_timeout').get()
+  check('10d SQLite busy_timeout 已开启 (>0)', Number(timeoutRow?.timeout ?? 0) > 0, JSON.stringify(timeoutRow))
+  check('10e 审计链完整（addInSlot 原子事务）', s.verifyAudit().ok)
   s.close()
 }
 

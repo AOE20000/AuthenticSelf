@@ -60,7 +60,7 @@ function signals(over = {}) {
   check('1d 没用过时连接不带来任何加分', Math.abs(linked.score - fresh.score) < 1e-9, `linked=${linked.score}`)
 
   // 1e store 层：写第二条不会抬高第一条（写入不是证据）
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const first = s.add('用户习惯用深色主题', { origin: 'user' })
   s.rescore()
   const before = read(s, 'SELECT salience FROM memory_entry WHERE id = ?', first.id).salience
@@ -95,7 +95,7 @@ function signals(over = {}) {
   check('2g 上限 = 0.5 + 0.5×trust', Math.abs(modelTen - 0.75) < 1e-9, `model=${modelTen}`)
 
   // 2h store 层：`touch()` 是唯一推分数的路径
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const used = s.add('用户真的用上的一条', { origin: 'user' })
   const idle = s.add('从没被用上的一条', { origin: 'user' })
   s.touch(used.id)
@@ -124,7 +124,7 @@ function signals(over = {}) {
   check('3d 90 天半衰期可复算', Math.abs(s90 - expected) < 1e-9, `${s90} vs ${expected}`)
 
   // 3e store 层：老条目在评分后降下来、且没跌破地板
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const old = s.add('五年前的一条旧事', { origin: 'user', salience: 0.9 })
   raw(s, 'UPDATE memory_entry SET t_start = ?, use_count = 3, last_used = ? WHERE id = ?',
     Date.now() - 5 * YEAR, Date.now() - 5 * YEAR, old.id)
@@ -156,7 +156,7 @@ function signals(over = {}) {
   check('4c 用过且 pin 时分数仍由证据决定', pinnedUsed.score === plainUsed.score, `${plainUsed.score} vs ${pinnedUsed.score}`)
 
   // 4d store 层：pinned 行十年后被评测也不低于 0.6
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const pinned = s.add('用户明确要求一直记住', { origin: 'user' })
   const twin = s.add('同一天写的对照条目', { origin: 'user' })
   raw(s, 'UPDATE memory_entry SET pinned = 1, t_start = ? WHERE id = ?', Date.now() - 10 * YEAR, pinned.id)
@@ -180,7 +180,7 @@ function signals(over = {}) {
   check('5a 纯函数：0<1<2<4<8 次严格递增', strict, series.map(v => v.toFixed(3)).join(' → '))
 
   // 5b store 层：三条只有"被用次数"不同的条目，评分后顺序与次数一致
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const a = s.add('零次', { origin: 'user' })
   const b = s.add('一次', { origin: 'user' })
   const c = s.add('三次', { origin: 'user' })
@@ -195,7 +195,7 @@ function signals(over = {}) {
 
 // ── 6. setSalience：只有一个写入口，且不许越过地板 ──────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const e = s.add('一条用来改权重的记忆', { origin: 'user' })
   check('6a 改到下限以下会被夹到地板', s.setSalience(e.id, 0.01) === true
     && Math.abs(read(s, 'SELECT salience FROM memory_entry WHERE id = ?', e.id).salience - SALIENCE_FLOOR) < 1e-12)
@@ -243,7 +243,7 @@ function signals(over = {}) {
 
 // ── 8. 审计：每次批量评分一条 as/salience，只记 id 与分数 ───────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const secret = '这条正文不该出现在审计里：用户 PIN 是 445566'
   const e = s.add(secret, { origin: 'user' })
   s.touch(e.id)

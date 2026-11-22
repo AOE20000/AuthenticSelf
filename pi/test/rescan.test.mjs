@@ -35,7 +35,7 @@ const PEM = [
 
 // ── 1. 旧明文（直接 SQL 塞进去，绕过写侧脱敏）能被扫出来 ────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   // 正常写入的一条（走写侧脱敏）
   const clean = s.add('项目用 Postgres 做存储', { origin: 'model' })
   // **直接用 SQL 塞进去**的一条：模拟"脱敏之前就已经落库"的旧明文
@@ -55,7 +55,7 @@ const PEM = [
 
 // ── 2. 写侧已脱敏的条目 → 零命中（幂等：同一套规则、不会重复替换）────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const entry = s.add(`key=${SK}\n请求头 Bearer ${TOKEN}\npassword=hunter2\n${PEM}\n指纹 ${HEXY}`, { origin: 'user' })
   const hits = s.scanForSecrets([entry])
   check('2a 写侧已脱敏的条目扫描零命中', hits.length === 0, JSON.stringify(hits))
@@ -100,7 +100,7 @@ const PEM = [
 
 // ── 6. 多个条目里只有一个命中 → 只报那一个 ─────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const a = s.add('今天天气不错', { origin: 'user' })
   const c = s.add('会议纪要已整理', { origin: 'model' })
   // 旧明文（SQL 直塞）：口令那一行
@@ -115,7 +115,7 @@ const PEM = [
 
 // ── 7. kinds 去重（同一 kind 命中两次只列一次）──────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   // 旧明文（SQL 直塞）：同一个 kind 命中两处
   s.db.prepare(`INSERT INTO memory_entry (id, kind, text, span, origin, trust, t_start)
     VALUES (?, 'fact', ?, 'short', 'user', 0.9, ?)`).run('m-old-two', `第一个 ${SK} 第二个 ${SK}`, Date.now())
@@ -130,7 +130,7 @@ const PEM = [
 
 // ── 8. scanForSecrets 不修改库里的任何一行 ─────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.add(`新写的 ${SK}`, { origin: 'user' })
   s.db.prepare(`INSERT INTO memory_entry (id, kind, text, span, origin, trust, t_start)
     VALUES (?, 'fact', ?, 'short', 'user', 0.9, ?)`).run('m-old', `旧的 ${SK}`, Date.now())
@@ -159,7 +159,7 @@ const PEM = [
     ['base64', HEXY],
   ]
   for (const [kind, secret] of cases) {
-    const s = new Store(':memory:')
+    const s = new Store(':memory:', { strict: false })
     const entry = s.add(`凭据 ${secret}`, { origin: 'user' })
     // 写侧已经把它脱敏了 → 库里那条扫不出命中；所以对**原文**扫，才看得出规则一致
     const hits = s.scanForSecrets([{ id: entry.id, text: `凭据 ${secret}` }])
@@ -174,7 +174,7 @@ const PEM = [
 
 // ── 10. 特殊条目：不受信任会话 / 兜底桶，走同一条路径、结果合理 ─────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   // 兜底桶（其他）：互不相关的事，不是槽——但它照样走 `add()`，照样被写侧脱敏
   const bucket = s.addInSlot(`兜底桶里的 key ${SK}`, { origin: 'user', tagPath: '其他' })
   check('10a 兜底桶条目同样被写侧脱敏', bucket.entry.text.includes('[已脱敏:sk-token]') && !bucket.entry.text.includes(SK),
@@ -194,7 +194,7 @@ const PEM = [
 
 // ── 11. 摘要同样会被注入 → 也要扫 ──────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.db.prepare(`INSERT INTO memory_entry (id, kind, text, summary, span, origin, trust, t_start)
     VALUES (?, 'fact', ?, ?, 'short', 'user', 0.9, ?)`)
     .run('m-old-sum', '旧正文', `旧摘要里的 key ${SK}`, Date.now())
@@ -208,7 +208,7 @@ const PEM = [
 
 // ── 12. 空候选 / 空文本 ────────────────────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   check('12a 空候选返回空数组', s.scanForSecrets([]).length === 0)
   check('12b 空文本条目不算命中', s.scanForSecrets([{ id: 'x', text: '' }]).length === 0)
   s.close()

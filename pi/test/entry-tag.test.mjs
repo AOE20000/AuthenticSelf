@@ -35,7 +35,7 @@ function mkTag(store, path) {
 
 // ── 1. 写入侧：主标签同时进 entry_tag ──────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const cityId = mkTag(s, '记忆/用户/城市')
   check('1a 逐层建枝成功（前置条件）', typeof cityId === 'string', String(cityId))
 
@@ -53,7 +53,7 @@ function mkTag(store, path) {
 // ── 2. 一条记忆可以挂多条路径（P-a 只是"有地方落"，还没接线）───────────────
 // 现在没有任何写入路径会产生附加标签，但表本身必须能装下——这是 P-e 的前提。
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const main = mkTag(s, '记忆/世界/势力/黑市势力')
   const economy = mkTag(s, '记忆/世界/经济制度')
   const api = mkTag(s, '记忆/世界/机制/预言API')
@@ -73,7 +73,7 @@ function mkTag(store, path) {
 {
   const dir = mkdtempSync(join(tmpdir(), 'as-entrytag-'))
   const file = join(dir, 'old.db')
-  const first = new Store(file)
+  const first = new Store(file, { strict: false })
   mkTag(first, '记忆/项目')
   first.add('老条目甲', { origin: 'user', tagPath: '记忆/项目' })
   first.add('老条目乙', { origin: 'user', tagPath: '记忆/项目' })
@@ -81,14 +81,14 @@ function mkTag(store, path) {
   first.db.exec('DROP TABLE entry_tag')
   first.close()
 
-  const reopened = new Store(file)
+  const reopened = new Store(file, { strict: false })
   const rows = reopened.db.prepare('SELECT COUNT(*) AS n FROM entry_tag').get().n
   check('3a 重开老库时自动回填', Number(rows) === 2, `rows=${rows}`)
   check('3b 回填后不变量成立', reopened.verifyEntryTag().ok === true,
     reopened.verifyEntryTag().missing.join(','))
   reopened.close()
 
-  const again = new Store(file)
+  const again = new Store(file, { strict: false })
   const rows2 = again.db.prepare('SELECT COUNT(*) AS n FROM entry_tag').get().n
   check('3c 回填幂等（再开一次不翻倍）', Number(rows2) === 2, `rows=${rows2}`)
   again.close()
@@ -97,7 +97,7 @@ function mkTag(store, path) {
 
 // ── 4. 不变量坏了要能报出来（而不是悄悄放过）───────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   mkTag(s, '记忆/项目')
   const entry = s.add('会被弄坏的一条', { origin: 'user', tagPath: '记忆/项目' })
   s.db.prepare('DELETE FROM entry_tag WHERE entry_id = ?').run(entry.id)
@@ -111,7 +111,7 @@ function mkTag(store, path) {
 
 // ── 5. mergeTag：合并标签后不变量不能破 ───────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   mkTag(s, '记忆/项目')
   mkTag(s, '记忆/工作/项目')
   const entry = s.add('项目名 Halcyon', { origin: 'user', tagPath: '记忆/项目' })
@@ -132,7 +132,7 @@ function mkTag(store, path) {
 
 // ── 6. pruneTag：上提空枝后不变量不能破 ───────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   mkTag(s, '记忆/项目/甲/子')
   const entry = s.add('甲项目的一条', { origin: 'user', tagPath: '记忆/项目/甲/子' })
   const moved = s.pruneTag('记忆/项目/甲')
@@ -147,7 +147,7 @@ function mkTag(store, path) {
 
 // ── 7. 不影响既有行为（P-a 是纯加法）──────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   mkTag(s, '记忆/用户/城市')
   const a = s.add('用户住在杭州西湖区', { origin: 'user', tagPath: '记忆/用户/城市' })
   const { superseded } = s.addInSlot('用户搬到了滨江区', { origin: 'user', tagPath: '记忆/用户/城市' })

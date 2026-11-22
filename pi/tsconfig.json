@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["types/pi-ambient.d.ts"],
+      "@earendil-works/pi-ai": ["types/pi-ambient.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "types/**/*.d.ts"]
+}

@@ -1,7 +1,7 @@
 # 记录 38：索引化设计（线索 / 实体 / 时间标签）
 
 > 2026-11-17。针对 [`08-completeness.md`](../08-completeness.md) B.1「索引区」与 B.2「索引化」缺口的技术方案设计。
-> **现状**：第 1 步的时间解析器已先行抽入 [`pi/src/facet.ts`](../../pi/src/facet.ts)（30 项单测）；其余表结构与召回接入随世界树重构（[`09-world-tree.md`](../09-world-tree.md)）暂停推进，待 P-d 之后衔接。
+> **现状**：**第 1 步与第 2 步已落地**——`store.ts` 已建 `entry_facet` 表与 `addFacet`/`approveFacet`/`facetsOf`/`listFacets`，`add()` 自动用 `facet.ts` 提取显式事件 `time`，`maintain.ts` + `index.ts` 已接 `ENTITY` 提案（只落 `proposed`），`commands.ts` 提供 `/as-facet` 审批与补记，`recall()` 已接入第三通道 `facetRel`（`cue`/`entity` 1.0、`time` 0.6 与同分破平）。余第 3 步（`memory_find`）与 `raw='mention'` 回填待按需评估；单测见 `indexing-facet.test.mjs` 与 `index-hooks.test.mjs`。
 
 ---
 

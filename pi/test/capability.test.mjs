@@ -61,7 +61,7 @@ function auditCount(store, kind) {
 {
   const s = new Store(':memory:')
   const scope = s.scoped('memory.write')
-  const entry = s.add('读方法测试', { origin: 'user' })
+  const entry = scope.add('读方法测试', { origin: 'user' })
   check('3a 作用域能读', scope.list().some(e => e.id === entry.id))
   check('3b 读不触发越权审计', auditCount(s, 'as/capability_denied') === 0)
 }
@@ -77,22 +77,30 @@ function auditCount(store, kind) {
   check('4b 组合调用没记越权审计', auditCount(s, 'as/capability_denied') === 0)
 }
 
-// ── 5. 默认开关关着：直调照常（今天的行为一字不变）─────────────────────────
+// ── 5. 降级开关：AS_CAPABILITY=0 或 { strict: false } 时放行直调 ───────────
+{
+  const before = process.env.AS_CAPABILITY
+  process.env.AS_CAPABILITY = '0'
+  try {
+    const s = new Store(':memory:')
+    const entry = s.add('直调写入', { origin: 'user' })
+    check('5a AS_CAPABILITY=0 时直调能写', s.list().some(e => e.id === entry.id))
+    check('5b AS_CAPABILITY=0 时不记越权审计', auditCount(s, 'as/capability_denied') === 0)
+  } finally {
+    if (before === undefined) delete process.env.AS_CAPABILITY
+    else process.env.AS_CAPABILITY = before
+  }
+
+  // 未传环境变量时（默认开启严格模式），{ strict: false } 仍可让单元测试白盒直调
+  const s2 = new Store(':memory:', { strict: false })
+  const e2 = s2.add('构造选项放行', { origin: 'user' })
+  check('5c strict:false 放行直调', s2.list().some(e => e.id === e2.id))
+}
+
+// ── 6. 默认严格模式开启：未走作用域的写调用一律拒绝 ────────────────────────
 {
   const before = process.env.AS_CAPABILITY
   delete process.env.AS_CAPABILITY
-  const s = new Store(':memory:')
-  const entry = s.add('直调写入', { origin: 'user' })
-  check('5a 开关关着时直调能写', s.list().some(e => e.id === entry.id))
-  check('5b 开关关着时不记越权审计', auditCount(s, 'as/capability_denied') === 0)
-  if (before === undefined) delete process.env.AS_CAPABILITY
-  else process.env.AS_CAPABILITY = before
-}
-
-// ── 6. 开关开着：未走作用域的写调用一律拒绝 ────────────────────────────────
-{
-  const before = process.env.AS_CAPABILITY
-  process.env.AS_CAPABILITY = '1'
   try {
     const s = new Store(':memory:')
     let threw = null
@@ -101,7 +109,7 @@ function auditCount(store, kind) {
     } catch (error) {
       threw = error
     }
-    check('6a 开关开着时直调被拒', threw !== null)
+    check('6a 默认严格模式下直调被拒', threw !== null)
     check('6b 拒的是 CapabilityError（不是 TypeError）', threw instanceof CapabilityError, String(threw?.name))
     check('6c 拒绝记了审计', auditCount(s, 'as/capability_denied') === 1)
     check('6d 被拒的写入没落库', s.list().length === 0, `count=${s.list().length}`)
@@ -110,7 +118,7 @@ function auditCount(store, kind) {
     // 走作用域就放行
     const scope = s.scoped('memory.write')
     const entry = scope.add('有权限的写入', { origin: 'user' })
-    check('6f 开关开着时作用域能写', s.list().some(e => e.id === entry.id))
+    check('6f 默认严格模式下作用域能写', s.list().some(e => e.id === entry.id))
     check('6g 作用域写入不新增越权审计', auditCount(s, 'as/capability_denied') === 1)
   } finally {
     if (before === undefined) delete process.env.AS_CAPABILITY

@@ -24,7 +24,7 @@ function read(store, sql, ...args) {
 
 // ── 1. seq：同会话递增，换会话从头数，无会话恒 0 ────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const a1 = s.add('会话 A 的第一条沉淀', { origin: 'user', sessionId: 'sess-a' })
   const a2 = s.add('会话 A 的第二条沉淀', { origin: 'user', sessionId: 'sess-a' })
   const a3 = s.add('会话 A 的第三条沉淀', { origin: 'model', sessionId: 'sess-a' })
@@ -52,7 +52,7 @@ function read(store, sql, ...args) {
 
 // ── 2. t_end：活着是 0，被取代 / 被抑制才有终点 ──────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const old = s.add('Halcyon 的缓存层用 Redis', { origin: 'user', tagPath: '记忆/项目' })
   check('2a 新写入的条目 tEnd 为 0', old.tEnd === 0, `tEnd=${old.tEnd}`)
 
@@ -81,7 +81,7 @@ function read(store, sql, ...args) {
 
 // ── 3. confidence：按来源给基线，显式传入为准，不随写入次数上升 ──────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const user = s.add('用户说过的一条事实', { origin: 'user' })
   const model = s.add('模型从上下文推的一条', { origin: 'model' })
   const human = s.add('人明确写的一条', { origin: 'human' })
@@ -107,7 +107,7 @@ function read(store, sql, ...args) {
 
 // ── 4. replacedByOf / supersedesOf：同一个指针的两个方向 ─────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const a = s.add('第一版：缓存用 Redis', { origin: 'user' })
   const b = s.add('第二版：缓存用本地 LRU', { origin: 'user' })
   const c = s.add('第三版：缓存用进程内 Map', { origin: 'user' })
@@ -130,7 +130,7 @@ function read(store, sql, ...args) {
 
 // ── 5. effectiveTrust / linkedEntries：关联取最不可信，只传一跳 ──────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const user = s.add('用户说自己的城市是北京', { origin: 'user' })
   const model = s.add('模型推测用户常驻北方', { origin: 'model' })
   s.addLink(user.id, model.id)
@@ -187,7 +187,7 @@ function read(store, sql, ...args) {
   old.prepare("INSERT INTO memory_entry (id, kind, text, span, origin, trust, t_start) VALUES ('m-old', 'fact', '旧库里的条目', 'short', 'user', 0.9, ?)").run(Date.now())
   old.close()
 
-  const s = new Store(file)
+  const s = new Store(file, { strict: false })
   const columns = s.db.prepare('PRAGMA table_info(memory_entry)').all().map(row => row.name)
   check('6a 老库自动补上 t_end 列', columns.includes('t_end'), `columns=${columns.join(',')}`)
   const kept = s.list().find(item => item.id === 'm-old')

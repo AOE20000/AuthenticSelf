@@ -15,7 +15,7 @@
 | A3 | 来源分层 + trust | ✅ | `TRUST_BY_ORIGIN`：human 1.0 / user .9 / archive .6 / model .5 / external .4 / imported .3 |
 | A4 | 软抑制（不删） | ✅ | `suppress()`，正文保留、写 `t_end` |
 | A5 | 召回打分 | ✅ | `recall()`：`relevance × salience × trust`，低于 0.15 / 0.25 淘汰；已去掉 `recency`（候选带日期由旁路判） |
-| A6 | 双通道召回（词 + 标签） | ✅ | 词（二元组）+ 标签（段名命中给满相关度）；实测零正文重叠经 `记忆/用户/城市` 命中（记录 11） |
+| A6 | 三通道召回（词 + 标签 + 索引化 facet） | ✅ | 词（二元组）+ 世界树（主标签与 `entry_tag` 附加标签段名命中给满相关度）+ `entry_facet`（`cue`/`entity` 1.0、`time` 0.6 与同分破平）；均受可达树过滤 |
 | A7 | 多轮注入 + 同句去重 + 审计 | ✅ | `state.rounds` / `state.injected` / `as/injection` |
 | A8 | 下行写入 | ✅ | 写入统一由记忆旁路·非阻塞相沉淀（`REMEMBER user\|model`），单一入口（记录 19 / 20） |
 | A9 | 相似度去重 0.82 | ✅ | `findSimilar()`，二元组 Jaccard |
@@ -23,9 +23,9 @@
 | A11 | 接管宿主压缩 | — | **当前形态不适用**：按 `03` 裁定 1 关掉 pi 宿主裁剪，改为默认关闭（`AS_COMPACT=1` 才开），压缩职责完全归按轮视图压缩与 turn 内折叠（记录 36） |
 | A12 | 按轮压缩（判重 + 保护 + 末轮不动） | ✅ | `turns.ts`；实测 `5/5`、`3/5`（记录 6） |
 | A13 | turn 内折叠工具结果 | ✅ | `context` 视图级折叠，`hasToolCall` 保护配对（记录 4 / 48） |
-| A14 | 维护旁路（打标 / 补记 / 关系 / 整理） | ✅ | `maintain.ts`；节拍持久化于 `meta.maint_last`（记录 8 / 9） |
-| A15 | 记忆旁路（阻塞相 / 非阻塞相） | ✅ | `memory.ts` + `wrapup.ts` + `phase.ts`；`DROP/REWRITE/USED/REDACT/STEP` 与 `REMEMBER/PREFETCH` 均实测（记录 20 / 21 / 29） |
-| A16 | 世界树（根保护、逐层创建、多树地基） | ✅ | `ensureTag` 17 项单测（记录 10）；世界树 P-a（`entry_tag` + 回填 + 自检，记录 49）、P-b（注入标新旧 + `history` 带同槽旧值，记录 50）、P-c（`tree`/`mount`/`tag.tree_id` + `globalPathOf`，记录 51）均已落地；P-d 可达树过滤与解除 7 字限制待后续期次 |
+| A14 | 维护旁路（打标 / 补记 / 关系 / 整理） | ✅ | `maintain.ts`；节拍持久化于 `meta.maint_last`，支持 `ENTITY` 提案写入 `proposed`（记录 8 / 9） |
+| A15 | 记忆旁路（阻塞相 / 非阻塞相） | ✅ | `memory.ts` + `wrapup.ts` + `phase.ts`；`DROP/REWRITE/USED/REDACT/STEP` 与 `REMEMBER/PREFETCH` 均实测，`PLAN_RULES` 预筛与阻塞相并发（记录 20 / 21 / 29） |
+| A16 | 世界树（根保护、逐层创建、多树挂载） | ✅ | `ensureTag` 17 项单测（记录 10）；世界树 P-a（`entry_tag` + 回填 + 自检，记录 49）、P-b（注入标新旧 + `history` 带同槽旧值，记录 50）、P-c（`tree`/`mount`/`tag.tree_id` + `globalPathOf`，记录 51）、P-d（`resolveTag` + 可达树过滤 + 全局路径渲染 + 嵌套挂载与只读拦截 + `/as-tree`/`/as-mount`）、P-e（`entry_tag` 附加标签参与召回 + `attachTag`/`extraTags`）均已落地并通过 50+20 项单测；余 P-f/g/h |
 | A17 | 交涉原语 `memory` 与 `change` | ✅ | 五动作齐：FORGET / REVISE / REMIND / LINK / UNLINK；加 `change` 声明通道（记录 12 / 16 / 17） |
 | A18 | 交涉通道（自然语言 → 旁路解析） | ✅ | 实测 `forget` → 条目 `suppressed`，下一轮不再注入（记录 12） |
 | A19 | 归档检索（分阶段下钻） | ✅ | 六层粒度钳制（所有→年→月→周→天→时），≤3 段直接给片段；`archive(q)` 走 R2、`archive(key)` 走 R3（记录 13 / 14 / 22） |
@@ -43,7 +43,7 @@
 | 计划区 | ✅ | `plan.ts` + `plan` 表 + `withPlan` + `as/plan`；`STEP <n>` 推进步骤打 `✓`，端到端已跑通（记录 27 / 29） |
 | 工作区 | ✅ | `AS_KEEP_RECENT` + 末轮无条件保护 |
 | 可压缩 | ✅ | 按轮纪要压缩 + 工具结果折叠（含 `toolCall` 配对保护，记录 48） |
-| 索引区 | 🟡 | 已有：索引行（日期 + 标题 + 字数）、`archive_pointer` + 情景摘要、六层下钻 + R3 取原文、`archive(q)`、会话备注、注入带来源/置信度、条目 `summary`、三条路径同源「已移出可恢复」信号（`recover.ts`，记录 43）；世界树完成 P-a/b/c。**仍缺**：线索 / 实体 / 时间标签索引（`facet` 仅完成时间解析器 [`facet.ts`](../pi/src/facet.ts)） |
+| 索引区 | ✅ | 已有：索引行（日期 + 标题 + 字数）、`archive_pointer` + 情景摘要、六层下钻 + R3 取原文、`archive(q)`、会话备注、注入带来源/置信度、条目 `summary`、三条路径同源「已移出可恢复」信号（`recover.ts`，记录 43）；世界树完成 P-a–e；线索 / 实体 / 时间 `entry_facet` 第 1–2 步已落地（`add` 自动提取时间、`ENTITY` 提案、`/as-facet` 与 `recall()` 第三通道），单测与钩子回归全过（`facet` / `indexing-facet` / `index-hooks`） |
 
 ### B.2 七种操作
 
@@ -53,7 +53,7 @@
 | 去重 | ✅ | `findSimilar` + `merge` |
 | 降权 | ✅ | 默认切至 `salience.ts` 绝对分评分模型（记录 46）；保留 `decay()`（`salience × 0.85`，下限 0.15，幂等闸，记录 26 / 29）供 `AS_SALIENCE=0` 退回。仍缺：`USED` 负例降权 |
 | 移出上下文 | ✅ | 视图级替换 / 折叠，存档不动 |
-| 索引化 | 🟡 | 世界树提供位置与多树地基（P-a/b/c ✅，P-d 起待做，见 [`09`](09-world-tree.md)）；线索 / 实体 / 时间三类索引整体待落表接入（方案见 [`records/38`](records/38-indexing-design.md)，已抽 `facet.ts`） |
+| 索引化 | 🟡 | 世界树 P-a–e 已落地 ✅（见 [`09`](09-world-tree.md)）；`entry_facet` 三类索引第 1–2 步已落地 ✅（见 [`records/38`](records/38-indexing-design.md)）。**仍缺**：世界树 P-f（祖先继承 + 范围剪枝）/ P-g（别名解析）/ P-h（孤儿枝体检），以及按需评估的第 3 步 `memory_find` 只读查询与 `raw='mention'` 回填 |
 | 归档 | ✅ | 指针 + 摘要 + 线索与时间双入口 |
 | 脱敏 | ✅ | 写侧 `scrubSecrets` 落库替换（记录 31）+ 注入前二次扫描 `rescanForInjection`（记录 37 / 41）+ 11 处持久化字段深度消毒（`scrubDeep`）+ 只读体检 `/as-scrub-scan`；上下文侧 `REDACT` 早有（记录 23）。存量旧库明文有意不回溯改库 |
 
@@ -94,13 +94,13 @@
 | B2 主 AI 不知道审批机制 | ✅ | 回执中性，不暴露角色 / 标准 / 历史裁决；无查询工具 |
 | B3 审批者 ⟂ 原始上下文 | ✅ | `buildApproverInput` 只给锚点、主 AI 声明、反思、历史变更链——不含对话原文与最新用户消息 |
 | B4 来源隔离（污点传播） | ✅ | 一跳取最不可信（`oneHopMinTrust` / `effectiveTrust` / `taintMap`）已落地（记录 34）。仍缺“用户显式确认升格”的数据模型 |
-| B5 旁路之间 ⟂ | ✅ | 存储层 `store.scoped(capability)` 写能力分级、`index.ts` 50 处写点全部走作用域、构造时能力表自检；`AS_CAPABILITY=1` 多轮带工具真会话实测越权 0 条（记录 42 / 45） |
+| B5 旁路之间 ⟂ | ✅ | 存储层 `store.scoped(capability)` 写能力分级、全扩展（含 `commands.ts` / `tools.ts`）全部写点走作用域、构造时能力表自检；严格直调闸门已**默认开启**（设 `AS_CAPABILITY=0` 或测试 `{ strict: false }` 可临时关闭），真会话越权 0 条（记录 42 / 45） |
 | B6 谁监督 R4 | — | **当前形态不适用**：pi 无独立 R4 角色，剔除由阻塞相发 `REDACT` 并落清单，靠极低触发率 + 审计链 + 作废派生沉淀兜底 |
-| B7 profile ⟂ | 🟡 | `AS_PROFILE` 物理隔离已成立（`profiles/<名>/memory.db`）。**仍缺**多 profile 编排（只读枚举、展示名对齐、不存在名报错，设计见记录 47） |
+| B7 profile ⟂ | ✅ | `AS_PROFILE` 物理隔离与防路径穿越（`..`/`.`/`\` 拒绝逃逸）已成立；多 profile 编排第 1 阶段（[`profile.ts`](../pi/src/profile.ts) `listProfiles()` 只读枚举、展示名与 `AS_DB` 覆盖对齐、启动误拼空库提醒与 `/as-profile` 核对，见记录 47）已落地并通过单测；运行中热切库按设计明确禁止 |
 | B7-a 信任等级 | ✅ | `session_trust` / `pending_write` 表、`writeMemory()` 统一拦截、8 条命令含 `/as-adopt-all` / `/as-dismiss-all` 与按来源筛选、`AS_PENDING_MAX` 积压上限（记录 28 / 32） |
 | B8 会话 ⟂、记忆共享 | ✅ | 会话日志按文件隔离，库共享 |
 | B9 子代理 ⟂ | — | **当前形态不适用**：宿主扩展 API 无创建子代理能力，宿主提供后再开启 |
-| B10 归档 ⟂ 上下文 | ✅ | `archive(q)` 仅查指针摘要（3×300 字、每轮限 2 次），上限弱于 `key`（3×400 字原文），不构成新破口；两条路均覆盖最近 500 条指针（记录 36） |
+| B10 归档 ⟂ 上下文 | ✅ | `archive(q)` 仅查指针摘要（3×300 字、每轮限 2 次），上限弱于 `key`（3×400 字原文），不构成新破口；`archiveRefs` / `searchArchive` 扫描上限已扩宽至 5000 / 2000 条指针（记录 36 + 单测） |
 | 不变量：L0 不可变 | ✅ | `anchors.ts` `Object.freeze` 常量，`l0Digest()` 指纹进审计 |
 | 不变量：external / imported 不得直改 L1/L2 | ✅ | `addAnchor()` 白名单仅放行 `human` / `maintenance` |
 | 不变量：origin 不可被自述覆盖 | ✅ | `origin` 只由代码写入，模型无修改路径 |
@@ -113,9 +113,9 @@
 |---|---|---|
 | M3 归档检索（分阶段下钻 + 备注） | ✅ | `archive.ts` + `note` 表 + `/as-archive` + `/as-note` |
 | M4 审计成链（HMAC 链 + 启动校验） | ✅ | `audit_chain`（`prev` + HMAC-SHA256）；启动校验断点；`/as-audit` 可查（密钥同库，防静默篡改） |
-| M5 分发（npm 包 / 双宿主） | 🟡 | `npm pack` 打包与解包独立 `npm test`（22 个文件）均过；`pi` CLI 1.4.0 及用户扩展目录部署（`scripts/deploy.sh`）均跑通真会话（记录 44）。**仍缺**：Aether 宿主验证（等其升至 pi 1.x）与 npm 发布 |
+| M5 分发（npm 包 / 双宿主） | 🟡 | `npm pack` 打包与 24 个仓内测试脚本（含钩子回归）均过；`pi` CLI 1.4.0 及用户扩展目录部署（`scripts/deploy.sh`，兼容 Windows `setx` 与 POSIX export 指引）均跑通（记录 44）。**仍缺**：Aether 宿主验证（等其升至 pi 1.x）与 npm 发布 |
 | M6 上下文组成可视 | ✅ | `view.ts`（每步快照 + `AS_VIEW=1` 只读页 + `AS_VIEW_SNAPSHOT` 离线导出，记录 33） |
-| 观测与人侧命令（`/as-*`） | ✅ | 18 个 `/as-*` 命令覆盖视图、记忆、审计、归档、大改审批、信任与积压、脱敏体检 |
+| 观测与人侧命令（`/as-*`） | ✅ | 21 个 `/as-*` 命令覆盖视图、记忆、审计、归档、大改审批、信任与积压、多 profile 只读核对、世界树与挂载管理、索引标签审核与脱敏体检 |
 
 ---
 
@@ -123,18 +123,17 @@
 
 | 状态 | 条目数 |
 |---|---|
-| ✅ 完成（已跑通过） | **58** |
-| 🟡 部分完成 | **5** |
+| ✅ 完成（已跑通过） | **60** |
+| 🟡 部分完成 | **3** |
 | ⬜ 未做 | **0** |
 | — 当前形态不适用 | **3** |
-| **合计** | **66（适用 63，完成度 ≈ 92%）** |
+| **合计** | **66（适用 63，完成度 ≈ 95%）** |
 
-### 剩下的 5 项 🟡（按优先级排序）
+### 剩下的 3 项 🟡（按优先级排序）
 
-1. **索引化**（B.2）与 **索引区**（B.1）：世界树改造（[`09-world-tree.md`](09-world-tree.md)）已完成 P-a/b/c，**下一步为 P-d**（`resolveTag()` + 可达树过滤 + 渲染换全局路径），之后视需要衔接 `entry_facet` 线索/实体/时间索引（[`records/38`](records/38-indexing-design.md)）。
-2. **B7 多 profile 编排**（D）：按[`记录 47`](records/47-profile-orchestration.md) 补只读枚举 `profiles/`、展示名对齐与误拼报错（不做进程内切库）。
-3. **M5 双宿主与发布**（E）：待 Aether 升级至 pi 1.x 后实测，以及使用干净 HEAD 发布 npm。
-4. **B1 残余旁路**（D）：SQLite 文件仍可被 shell 读取（`02` B1-a 承认的已知边界，若要物理封死需替换宿主 `FileSystem` provider 与进程沙箱）。
+1. **索引化**（B.2）：世界树已完成 P-a–e、`entry_facet` 已完成第 1–2 步（三通道召回 + `/as-facet` + `ENTITY` 提案）；**下一步为世界树 P-f**（祖先继承 + 范围剪枝）/ P-g（别名解析）/ P-h（孤儿枝体检）与按需评估的 `memory_find`（[`records/38`](records/38-indexing-design.md)）。
+2. **M5 双宿主与发布**（E）：待 Aether 升级至 pi 1.x 后实测，以及使用干净 HEAD 发布 npm。
+3. **B1 残余旁路**（D）：SQLite 文件仍可被 shell 读取（`02` B1-a 承认的已知边界，若要物理封死需替换宿主 `FileSystem` provider 与进程沙箱）。
 
 > 另有两项已标 `✅` 但带**刻意留白**：① 旧条目在库内仍为明文（有意不回溯篡改历史，已由注入前二次扫描与 `/as-scrub-scan` 兜底）；② 降权基于闲置天数而非 `USED` 负例。
 

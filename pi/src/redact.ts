@@ -42,8 +42,8 @@ function redactText(text: string, rules: readonly RedactionRule[]): { text: stri
 export function applyRedactions(
   messages: readonly unknown[],
   rules: readonly RedactionRule[],
-): { messages: readonly unknown[]; hits: number } {
-  if (rules.length === 0) return { messages, hits: 0 }
+): { messages: readonly unknown[]; hits: number; touchedIndices: number[] } {
+  if (rules.length === 0) return { messages, hits: 0, touchedIndices: [] }
   let hits = 0
   let changed = false
 
@@ -80,8 +80,13 @@ export function applyRedactions(
     return value
   }
 
-  const walked = messages.map(message => walk(message))
-  return { messages: changed ? walked : messages, hits }
+  const touchedIndices: number[] = []
+  const walked = messages.map((message, index) => {
+    const mapped = walk(message)
+    if (mapped !== message) touchedIndices.push(index)
+    return mapped
+  })
+  return { messages: changed ? walked : messages, hits, touchedIndices }
 }
 
 /**

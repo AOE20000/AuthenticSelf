@@ -25,6 +25,8 @@ export interface MaintenanceResult {
     | { op: 'merge'; from: string; to: string }
     | { op: 'prune'; path: string }
   )[]
+  /** 索引化实体提案（只落 proposed 状态，需人审升格）。 */
+  entities: { entry: number; value: string }[]
   /** 被确认用上的注入：编号指向「最近注入的记忆」清单。 */
   usages: number[]
 }
@@ -48,6 +50,7 @@ export const MAINTENANCE_RULES = [
   'USED <编号>                 ← 这条注入的记忆在那几轮回答里确实被用上了',
   'SUPERSEDE <旧编号> <新编号>   ← 旧记忆被新记忆取代（同一事实的新版本）',
   'MERGE <旧编号> <新编号>       ← 旧记忆的信息被新记忆完全包含',
+  'ENTITY <编号> | <实体名>      ← 建议给这条记忆加实体索引（项目/系统/人名；将进待审队列）',
   '',
   '什么时候 MARK（只标非留不可的）：',
   '- 用户立下了承诺、定了截止时间、明确了约束',
@@ -126,6 +129,7 @@ export function parseMaintenance(output: string): MaintenanceResult {
   const remembers: MaintenanceResult['remembers'] = []
   const relations: MaintenanceResult['relations'] = []
   const tagOps: MaintenanceResult['tagOps'] = []
+  const entities: MaintenanceResult['entities'] = []
   const usages: number[] = []
   for (const rawLine of output.split('\n')) {
     const line = rawLine.trim()
@@ -172,7 +176,16 @@ export function parseMaintenance(output: string): MaintenanceResult {
       if (Number.isFinite(older) && Number.isFinite(newer) && older !== newer) {
         relations.push({ op: relation[1].toUpperCase() === 'MERGE' ? 'merge' : 'supersede', older, newer })
       }
+      continue
+    }
+    const entity = /^ENTITY\s+#?(\d+)\s*\|\s*(.+)$/iu.exec(line)
+    if (entity !== null) {
+      const entry = Number(entity[1])
+      const value = entity[2].trim()
+      if (Number.isFinite(entry) && value.length >= 2 && value.length <= 32) {
+        entities.push({ entry, value })
+      }
     }
   }
-  return { marks, tags, remembers, relations, tagOps, usages }
+  return { marks, tags, remembers, relations, tagOps, entities, usages }
 }

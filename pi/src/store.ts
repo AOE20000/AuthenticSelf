@@ -10,16 +10,13 @@
 import { createHmac, randomBytes } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { homedir } from 'node:os'
-// 下面是本包内唯一的静态导入。两个约束只能满足一边，取运行时：
-// - 源码由 node 直接跑（`--experimental-strip-types`），ESM 要求**显式扩展名**；
-// - tsc 的 bundler 解析拒收 `.ts` 后缀（TS5097），除非打开 `allowImportingTsExtensions`。
-// 带扩展名：宿主与测试都直接跑源码，Node 的 ESM 解析不做扩展名补全。
-// 类型检查侧靠 tsconfig 的 `allowImportingTsExtensions` 放行，不需要 `@ts-expect-error`。
+import { dirname } from 'node:path'
 import { scrubDeep, scrubSecrets } from './redact.ts'
-// 评分的公式与地板都在纯函数模块里（可单测、无 IO）。这里只负责"读信号、写回列"。
 import { SALIENCE_FLOOR, scoreSalience } from './salience.ts'
+import { defaultDbPath, normalizeProfileName } from './profile.ts'
+import { overlaps, parseTimeExpression } from './facet.ts'
+
+export { defaultDbPath, normalizeProfileName }
 
 // ── 写能力分级（B5；设计见记录 40，实施见记录 42）─────────────────────────
 //
@@ -109,13 +106,16 @@ const METHOD_CAPABILITY = {
   detachTree: 'tree.write',
   suppress: 'memory.suppress',
   supersede: 'memory.supersede',
-  // 关联与标签
+  // 关联与标签与索引
   addLink: 'relation.write',
   removeLink: 'relation.write',
   merge: 'relation.write',
   ensureTag: 'relation.write',
+  attachTag: 'relation.write',
   mergeTag: 'relation.write',
   pruneTag: 'relation.write',
+  addFacet: 'relation.write',
+  approveFacet: 'relation.write',
   // 剔除
   addRedaction: 'redaction.write',
   suppressDerived: 'redaction.write',
@@ -162,7 +162,8 @@ const READ_METHODS = [
   'dueChanges', 'verifyAudit', 'recentAudit', 'redactionAudit', 'redactions',
   'getPlan', 'archiveRefs', 'searchArchive', 'scanForSecrets', 'turnMarks',
   'entryTags', 'verifyEntryTag',
-  'trees', 'treeOf', 'mounts', 'globalPathOf',
+  'trees', 'treeOf', 'mounts', 'globalPathOf', 'reachableTrees', 'resolveTag',
+  'facetsOf', 'listFacets',
 ] as const
 
 /** 写方法名 → 能力。 */
@@ -190,13 +191,11 @@ export type StoreScope<C extends Capability = Capability> =
   }
 
 /**
- * 严格开关：`AS_CAPABILITY=1` 时，**未走作用域**的写调用一律拒绝（并记审计）。
- *
- * 默认（`'0'`）保持今天的行为——`index.ts` 的写点还没全部换成作用域调用，
- * 一次性全开会同时让二十来处变红（记录 42 §3）。
+ * 严格开关：默认开启（`AS_CAPABILITY !== '0'`），未走作用域的写调用一律拒绝并记审计；
+ * 仅显式传 `AS_CAPABILITY=0` 或构造 `{ strict: false }` 时关闭（P2-A）。
  */
 function capabilityGateEnabled(): boolean {
-  return (process.env.AS_CAPABILITY ?? '').trim() === '1'
+  return (process.env.AS_CAPABILITY ?? '').trim() !== '0'
 }
 
 /**
@@ -208,10 +207,10 @@ function capabilityGateEnabled(): boolean {
  */
 const INTERNAL_METHODS = [
   'scoped', 'close',
-  'guardWrite', 'denyCapability', 'runAuthorized', 'writeAudit',
+  'guardWrite', 'denyCapability', 'runAuthorized', 'writeAudit', 'withTx',
   'installCapabilityGate', 'verifyCapabilityTable',
   'nextSeq', 'oneHopMinTrust', 'taintMap', 'addMeta', 'auditKey',
-  'backfillEntryTag', 'retagEntryTag', 'treeName', 'treeChainOf',
+  'backfillEntryTag', 'retagEntryTag', 'treeName', 'treeChainOf', 'isTreeReadonly',
 ] as const
 
 /** 超过这个字符数即判为长条目；注入时优先给短条目让位。 */
@@ -474,6 +473,7 @@ CREATE TABLE IF NOT EXISTS entry_tag (
   created  INTEGER NOT NULL,
   PRIMARY KEY (entry_id, tag_id)
 );
+CREATE INDEX IF NOT EXISTS idx_entry_tag_tag ON entry_tag (tag_id);
 
 -- 世界树的多棵树（P-c，见 09 §8）。
 -- **单根不破**：AI 看到的命名空间仍只有一个根；这里存的是"数据库里有几棵树"，
@@ -540,6 +540,7 @@ CREATE TABLE IF NOT EXISTS archive_pointer (
 );
 
 CREATE INDEX IF NOT EXISTS idx_archive_ts ON archive_pointer (turn_ts);
+CREATE INDEX IF NOT EXISTS idx_archive_session_ts ON archive_pointer (session_file, turn_ts);
 
 -- 下轮预取：turn 末旁路猜"下一轮可能要用哪几条"，只排优先级，不注入（01 §5.5）。
 CREATE TABLE IF NOT EXISTS prefetch (
@@ -592,6 +593,8 @@ CREATE TABLE IF NOT EXISTS memory_link (
   created  INTEGER NOT NULL,
   PRIMARY KEY (from_id, to_id)
 );
+CREATE INDEX IF NOT EXISTS idx_memory_link_from ON memory_link (from_id);
+CREATE INDEX IF NOT EXISTS idx_memory_link_to ON memory_link (to_id);
 
 -- 用户备注：**挂在会话上**，不是挂在某条对话上；由人写，不注入上下文。
 -- 它是检索入口（"我给它写过什么"），与分阶段时间检索并列。
@@ -648,6 +651,23 @@ CREATE TABLE IF NOT EXISTS pending_change (
   created    INTEGER NOT NULL,
   decided    INTEGER
 );
+
+-- 索引化（线索 / 实体 / 时间标签，见 records/38-indexing-design.md）：
+-- 独立于世界树标签树，支持时间窗口重叠、线索词与待审实体提案。
+CREATE TABLE IF NOT EXISTS entry_facet (
+  id       TEXT PRIMARY KEY,
+  entry_id TEXT NOT NULL,
+  kind     TEXT NOT NULL,
+  value    TEXT NOT NULL,
+  raw      TEXT NOT NULL DEFAULT '',
+  from_ms  INTEGER,
+  to_ms    INTEGER,
+  origin   TEXT NOT NULL DEFAULT 'human',
+  state    TEXT NOT NULL DEFAULT 'active',
+  created  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_facet_entry ON entry_facet (entry_id, state);
+CREATE INDEX IF NOT EXISTS idx_facet_kind_val ON entry_facet (kind, state, value);
 `
 
 export interface MemoryEntry {
@@ -700,21 +720,25 @@ export interface MemoryEntry {
   scrubbed?: string[]
 }
 
-/** 库文件默认位置：`$PI_HOME/agent/authentic-self/memory.db`。 */
-export function defaultDbPath(): string {
-  const home = process.env.PI_HOME?.trim()
-  const root = home === undefined || home === '' ? join(homedir(), '.pi') : home
-  const base = join(root, 'agent', 'authentic-self')
-  // profile 隔离（`02` B7 / D20）：一个 profile 一套库，互不共享可变状态。
-  // 名字里不许有路径分隔符——否则 `AS_PROFILE=../../x` 能把库写到别处去。
-  const profile = (process.env.AS_PROFILE ?? '').trim().replace(/[\/:*?"<>|]/gu, '')
-  if (profile === '') return join(base, 'memory.db')
-  return join(base, 'profiles', profile.slice(0, 32), 'memory.db')
+/** 索引化标签项（线索 / 实体 / 时间，见 `records/38`）。 */
+export interface EntryFacet {
+  id: string
+  entryId: string
+  kind: 'cue' | 'entity' | 'time'
+  value: string
+  raw: string
+  fromMs?: number
+  toMs?: number
+  origin: string
+  state: 'active' | 'proposed' | 'dismissed'
+  created: number
 }
 
-/** 字符二元组，用于无依赖的粗粒度相关度。 */
+/** `defaultDbPath` 仍从此处导出；实现已迁入 `profile.ts`。 */
+
+/** 字符二元组，用于无依赖的粗粒度相关度（拉丁字母统一小写，匹配口径与归档检索对齐）。 */
 function bigrams(text: string): Set<string> {
-  const normalized = text.replace(/\s+/gu, '')
+  const normalized = text.replace(/\s+/gu, '').toLowerCase()
   const out = new Set<string>()
   for (let i = 0; i + 1 < normalized.length; i += 1) out.add(normalized.slice(i, i + 2))
   return out
@@ -752,6 +776,8 @@ interface Row {
   state: string
   replaced_by: string | null
   tag_path: string | null
+  tag_id?: string | null
+  tag_tree_id?: string | null
   pinned: number
   doc_verdict: string
   doc_reason: string
@@ -804,12 +830,16 @@ export interface RedactionAuditView {
 /** 记忆库。 */
 export class Store {
   private readonly db: DatabaseSync
+  private readonly strictOverride?: boolean
   private counter = 0
+  private txDepth = 0
 
-  constructor(file: string = defaultDbPath()) {
+  constructor(file: string = defaultDbPath(), options: { strict?: boolean } = {}) {
+    this.strictOverride = options.strict
     mkdirSync(dirname(file), { recursive: true })
     this.db = new DatabaseSync(file)
     this.db.exec('PRAGMA journal_mode = WAL')
+    this.db.exec('PRAGMA busy_timeout = 5000')
     this.db.exec(DDL)
     // 旧库迁移：v1 没有 replaced_by
     // 两张信任表（session_trust / pending_write）是**整表新增**，不涉及列迁移：
@@ -897,7 +927,8 @@ export class Store {
    */
   private guardWrite(method: string, capability: Capability): void {
     if (this.authorizedDepth > 0) return
-    if (!capabilityGateEnabled()) return
+    const strict = this.strictOverride ?? capabilityGateEnabled()
+    if (!strict) return
     throw this.denyCapability(
       method,
       capability,
@@ -1266,22 +1297,114 @@ export class Store {
   }
 
   /**
-   * 把一棵树挂到主树里的某个标签下（`09` §8）。
-   *
-   * **parent 只按主树路径解析**（P-c 的范围）：形如 `记忆/项目/碧蓝航线`。
-   * 在子树里再挂一棵（嵌套挂载）要按**全局路径**解析，那是 P-d 与全局路径解析一起做——
-   * 现在硬做会得到一个"路径有两种含义"的半成品。
-   *
-   * 五条拒绝，每条对应一条约束：
-   * - 树不存在 —— 挂一个不存在的东西没有意义；
-   * - 树是主树 —— 主树是命名空间的根，不能被挂到自己的枝下；
-   * - 挂载点不存在 —— 挂载点必须是**真标签**（这样它能被继承、剪枝，也能挂自己的记忆）；
-   * - 该点已挂 / 该树已挂 —— `mount` 的两条 UNIQUE：一个点只挂一棵、一棵树只挂一处；
-   * - 成环 —— 否则路径解析与祖先继承死循环。
-   * @param parentTagPath - 主树里的挂载点路径。
-   * @param treeId - 要挂的树。
-   * @param options.readonly - 只读挂载：拒写子树（默认可写）。
-   * @returns `ok` 与拒绝理由。
+   * 当前所有**可达**的树 id（`main` 及沿 `mount` 边可达的子树）。
+   * 未被挂载的孤立子树不在此集合内，`recall()` 据此实现解耦过滤（`09` §8.5 / §10.5）。
+   */
+  reachableTrees(): Set<string> {
+    const out = new Set<string>([MAIN_TREE])
+    const queue: string[] = [MAIN_TREE]
+    const mounts = this.db.prepare(`
+      SELECT COALESCE(t.tree_id, 'main') AS parent_tree, m.tree_id AS child_tree
+      FROM mount m JOIN tag t ON t.id = m.parent_tag_id
+    `).all() as unknown as { parent_tree: string; child_tree: string }[]
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      for (const edge of mounts) {
+        if (edge.parent_tree === current && !out.has(edge.child_tree)) {
+          out.add(edge.child_tree)
+          queue.push(edge.child_tree)
+        }
+      }
+    }
+    return out
+  }
+
+  /** 判断某棵树（含沿上行挂载链）是否处于只读挂载状态。 */
+  private isTreeReadonly(treeId: string): boolean {
+    if (treeId === MAIN_TREE) return false
+    const seen = new Set<string>()
+    let current: string | undefined = treeId
+    while (current !== undefined && current !== MAIN_TREE) {
+      if (seen.has(current)) break
+      seen.add(current)
+      const row = this.db.prepare(`
+        SELECT m.readonly, COALESCE(t.tree_id, 'main') AS parent_tree
+        FROM mount m JOIN tag t ON t.id = m.parent_tag_id
+        WHERE m.tree_id = ?
+      `).get(current) as unknown as { readonly: number; parent_tree: string } | undefined
+      if (row === undefined) return false
+      if (row.readonly === 1) return true
+      current = row.parent_tree
+    }
+    return false
+  }
+
+  /**
+   * 全局路径 → 节点解析（最长挂载点前缀算法，`09` §8.4 + §12 R 支持嵌套挂载）。
+   * 例：`记忆/项目/碧蓝航线/舰船/企业` → 在 `main` 命中最长挂载前缀 `记忆/项目/碧蓝航线` →
+   * 跳到子树查找 `碧蓝航线/舰船/企业`。只查询不建点。
+   */
+  resolveTag(globalPath: string): {
+    id: string
+    path: string
+    treeId: string
+    globalPath: string
+    readonly: boolean
+  } | undefined {
+    let segments = globalPath.split('/').map(part => part.trim()).filter(part => part !== '')
+    if (segments.length === 0) return undefined
+    if (segments[0] !== ROOT_TAG) segments = [ROOT_TAG, ...segments]
+
+    let treeId = MAIN_TREE
+    let readonly = false
+    const visitedTrees = new Set<string>([MAIN_TREE])
+
+    while (true) {
+      const candidatePath = segments.join('/')
+      const childMounts = this.db.prepare(`
+        SELECT t.path AS parent_path, m.tree_id AS child_tree_id, t2.name AS child_root, m.readonly
+        FROM mount m
+        JOIN tag t ON t.id = m.parent_tag_id
+        JOIN tree t2 ON t2.id = m.tree_id
+        WHERE COALESCE(t.tree_id, 'main') = ?
+      `).all(treeId) as unknown as {
+        parent_path: string
+        child_tree_id: string
+        child_root: string
+        readonly: number
+      }[]
+
+      let best: typeof childMounts[number] | undefined
+      for (const m of childMounts) {
+        if (candidatePath.startsWith(`${m.parent_path}/`)) {
+          if (best === undefined || m.parent_path.length > best.parent_path.length) best = m
+        }
+      }
+      if (best !== undefined) {
+        if (visitedTrees.has(best.child_tree_id)) return undefined
+        visitedTrees.add(best.child_tree_id)
+        readonly = readonly || best.readonly === 1
+        const rest = candidatePath.slice(best.parent_path.length + 1).split('/')
+        treeId = best.child_tree_id
+        segments = [best.child_root, ...rest]
+        continue
+      }
+
+      const row = this.db.prepare("SELECT id, path, COALESCE(tree_id, 'main') AS tree_id FROM tag WHERE path = ? AND COALESCE(tree_id, 'main') = ?")
+        .get(candidatePath, treeId) as unknown as { id: string; path: string; tree_id: string } | undefined
+      if (row === undefined) return undefined
+      return {
+        id: row.id,
+        path: row.path,
+        treeId: row.tree_id,
+        globalPath: this.globalPathOf(row.id) ?? row.path,
+        readonly: readonly || this.isTreeReadonly(row.tree_id),
+      }
+    }
+  }
+
+  /**
+   * 把一棵树挂到全局路径指定的标签下（支持主树及已挂载子树下的嵌套挂载，`09` §8 + §12 R）。
    */
   attachTree(
     parentTagPath: string,
@@ -1291,32 +1414,27 @@ export class Store {
     if (this.treeName(treeId) === undefined) return { ok: false, reason: '树不存在' }
     if (treeId === MAIN_TREE) return { ok: false, reason: '主树不能被挂载' }
 
-    const parentPath = normalizeTagPath(parentTagPath)
-    const parent = this.db.prepare('SELECT id, tree_id FROM tag WHERE path = ?').get(parentPath) as unknown as
-      { id: string; tree_id: string | null } | undefined
-    if (parent === undefined) return { ok: false, reason: '挂载点不存在' }
-    if ((parent.tree_id ?? MAIN_TREE) !== MAIN_TREE) {
-      return { ok: false, reason: '挂载点必须在主树里（嵌套挂载待 P-d）' }
-    }
+    const resolved = this.resolveTag(parentTagPath)
+    if (resolved === undefined) return { ok: false, reason: '挂载点不存在' }
 
-    if (this.db.prepare('SELECT 1 FROM mount WHERE parent_tag_id = ?').get(parent.id) !== undefined) {
+    if (this.db.prepare('SELECT 1 FROM mount WHERE parent_tag_id = ?').get(resolved.id) !== undefined) {
       return { ok: false, reason: '该挂载点已经挂了一棵树' }
     }
     if (this.db.prepare('SELECT 1 FROM mount WHERE tree_id = ?').get(treeId) !== undefined) {
       return { ok: false, reason: '这棵树已经挂在别处' }
     }
-    if (this.treeChainOf(parent.id).includes(treeId)) return { ok: false, reason: '会成环' }
+    if (this.treeChainOf(resolved.id).includes(treeId)) return { ok: false, reason: '会成环' }
 
     this.counter += 1
     this.db.prepare('INSERT INTO mount (id, parent_tag_id, tree_id, readonly, created) VALUES (?, ?, ?, ?, ?)')
       .run(
         `mount-${Date.now().toString(36)}-${this.counter}`,
-        parent.id,
+        resolved.id,
         treeId,
         options.readonly === true ? 1 : 0,
         Date.now(),
       )
-    this.appendAudit('as/mount', { action: 'attach', parent: parentPath, tree: treeId })
+    this.appendAudit('as/mount', { action: 'attach', parent: resolved.globalPath, tree: treeId })
     return { ok: true }
   }
 
@@ -1361,11 +1479,16 @@ export class Store {
       salience?: number
       sessionId?: string
       tagPath?: string
+      extraTags?: readonly string[]
       confidence?: number
       /** 写到哪棵树里（世界树 P-c）。省略 = 主树，老调用点一字不改。 */
       treeId?: string
     } = {},
   ): MemoryEntry {
+    const targetTree = options.treeId ?? MAIN_TREE
+    if (targetTree !== MAIN_TREE && this.isTreeReadonly(targetTree)) {
+      throw new Error(`只读挂载树不允许写入记忆（tree=${targetTree}）`)
+    }
     this.counter += 1
     const id = `m-${Date.now().toString(36)}-${this.counter}`
     const origin = options.origin ?? 'model'
@@ -1396,7 +1519,7 @@ export class Store {
       docReason: '',
       ...scrubbed === undefined ? {} : { scrubbed },
     }
-    const tagId = options.tagPath === undefined ? undefined : this.ensureTag(options.tagPath, options.treeId)
+    const tagId = options.tagPath === undefined ? undefined : this.ensureTag(options.tagPath, targetTree)
     if (tagId !== undefined) entry.tag = options.tagPath
     this.db.prepare(`
       INSERT INTO memory_entry (id, kind, text, span, origin, trust, session_id, seq, t_start, t_end, salience, confidence, state, pinned, tag_id, use_count)
@@ -1407,18 +1530,151 @@ export class Store {
       tagId ?? null,
     )
     // 主标签同时写进 `entry_tag`（世界树 P-a 的不变量，见 `verifyEntryTag`）。
-    // **必须在 INSERT 之后**：`entry_tag` 没有外键，写早了就是一条指向不存在条目的行。
-    // 目前只写主标签——附加标签要等 P-e 有地方提议它们时再进来。
     if (tagId !== undefined) {
       this.db
         .prepare('INSERT OR IGNORE INTO entry_tag (entry_id, tag_id, created) VALUES (?, ?, ?)')
         .run(entry.id, tagId, entry.tStart)
+    }
+    // P-e：附加标签写入
+    if (options.extraTags !== undefined) {
+      for (const extra of options.extraTags) {
+        this.attachTag(entry.id, extra, targetTree === MAIN_TREE ? undefined : targetTree)
+      }
+    }
+    // 索引化第 1 步：封闭词表提取明确事件时间 facet（origin='code'，认不出就不记）
+    const timeFacet = parseTimeExpression(body, entry.tStart)
+    if (timeFacet !== undefined) {
+      this.addFacet(entry.id, {
+        kind: 'time',
+        value: timeFacet.label,
+        raw: timeFacet.raw,
+        fromMs: timeFacet.start,
+        toMs: timeFacet.end,
+        origin: 'code',
+      })
+    }
+    if (targetTree !== MAIN_TREE) {
+      this.appendAudit('as/mount_write', { tree: targetTree, entryId: entry.id })
     }
     if (scrubbed !== undefined) {
       // 审计只记种类与条数：审计链不该成为敏感原文的第二份副本，也不该记位置
       this.appendAudit('as/scrub', { kinds: scrubbed, count: scrub.hits.length })
     }
     return entry
+  }
+
+  /** 为既有条目挂载附加标签（世界树 P-e，只追加不覆盖主标签）。 */
+  attachTag(entryId: string, tagPath: string, treeId?: string): boolean {
+    if (treeId !== undefined && treeId !== MAIN_TREE && this.isTreeReadonly(treeId)) return false
+    const resolved = treeId === undefined ? this.resolveTag(tagPath) : undefined
+    if (resolved !== undefined && resolved.readonly) return false
+    const tagId = resolved?.id ?? this.ensureTag(tagPath, treeId ?? MAIN_TREE)
+    if (tagId === undefined) return false
+    const exists = this.db.prepare('SELECT 1 FROM memory_entry WHERE id = ?').get(entryId)
+    if (exists === undefined) return false
+    const res = this.db
+      .prepare('INSERT OR IGNORE INTO entry_tag (entry_id, tag_id, created) VALUES (?, ?, ?)')
+      .run(entryId, tagId, Date.now())
+    return Number(res.changes) > 0
+  }
+
+  /** 添加一条索引 facet（`cue` / `entity` / `time`；`model` 禁止直写，`maintenance` 只落 `proposed`）。 */
+  addFacet(
+    entryId: string,
+    input: {
+      kind: 'cue' | 'entity' | 'time'
+      value: string
+      raw?: string
+      fromMs?: number
+      toMs?: number
+      origin?: 'human' | 'code' | 'maintenance' | 'model'
+    },
+  ): string | undefined {
+    const origin = input.origin ?? 'human'
+    if (origin === 'model') return undefined
+    const state: 'active' | 'proposed' = origin === 'maintenance' ? 'proposed' : 'active'
+    const normalized = input.value.trim().replace(/\s+/gu, ' ').toLowerCase()
+    if (normalized === '' || normalized.length > 32) return undefined
+    const raw = (input.raw ?? input.value).trim().slice(0, 64)
+    const existsEntry = this.db.prepare('SELECT 1 FROM memory_entry WHERE id = ?').get(entryId)
+    if (existsEntry === undefined) return undefined
+
+    const existingCount = this.db
+      .prepare("SELECT COUNT(*) AS n FROM entry_facet WHERE entry_id = ? AND kind = ? AND state <> 'dismissed'")
+      .get(entryId, input.kind) as unknown as { n: number }
+    if (Number(existingCount.n) >= 8) return undefined
+
+    const dup = this.db
+      .prepare("SELECT id FROM entry_facet WHERE entry_id = ? AND kind = ? AND value = ? AND state <> 'dismissed'")
+      .get(entryId, input.kind, normalized) as unknown as { id: string } | undefined
+    if (dup !== undefined) return undefined
+
+    this.counter += 1
+    const id = `f-${Date.now().toString(36)}-${this.counter}`
+    this.db.prepare(`
+      INSERT INTO entry_facet (id, entry_id, kind, value, raw, from_ms, to_ms, origin, state, created)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, entryId, input.kind, normalized, raw,
+      input.fromMs ?? null, input.toMs ?? null, origin, state, Date.now(),
+    )
+    this.appendAudit('as/facet', { action: 'add', id, entryId, kind: input.kind, state, origin })
+    return id
+  }
+
+  /** 审核一条 `proposed` facet 提案（升为 `active` 或驳回为 `dismissed`）。 */
+  approveFacet(facetId: string, approve: boolean): boolean {
+    const next = approve ? 'active' : 'dismissed'
+    const res = this.db
+      .prepare("UPDATE entry_facet SET state = ? WHERE id = ? AND state = 'proposed'")
+      .run(next, facetId)
+    if (Number(res.changes) === 0) return false
+    this.appendAudit('as/facet', { action: approve ? 'approve' : 'dismiss', id: facetId })
+    return true
+  }
+
+  /** 读某条记忆的索引 facets。 */
+  facetsOf(entryId: string): EntryFacet[] {
+    const rows = this.db
+      .prepare("SELECT * FROM entry_facet WHERE entry_id = ? AND state <> 'dismissed' ORDER BY created")
+      .all(entryId) as unknown as Record<string, unknown>[]
+    return rows.map(row => ({
+      id: String(row.id),
+      entryId: String(row.entry_id),
+      kind: row.kind as EntryFacet['kind'],
+      value: String(row.value),
+      raw: String(row.raw ?? ''),
+      ...row.from_ms === null ? {} : { fromMs: Number(row.from_ms) },
+      ...row.to_ms === null ? {} : { toMs: Number(row.to_ms) },
+      origin: String(row.origin),
+      state: row.state as EntryFacet['state'],
+      created: Number(row.created),
+    }))
+  }
+
+  /** 列出索引 facets（可按状态 / 种类过滤）。 */
+  listFacets(options: { kind?: EntryFacet['kind']; state?: EntryFacet['state']; limit?: number } = {}): EntryFacet[] {
+    const clauses: string[] = []
+    const params: unknown[] = []
+    if (options.kind !== undefined) { clauses.push('kind = ?'); params.push(options.kind) }
+    if (options.state !== undefined) { clauses.push('state = ?'); params.push(options.state) }
+    const where = clauses.length === 0 ? '' : `WHERE ${clauses.join(' AND ')}`
+    params.push(options.limit ?? 50)
+    const rows = this.db
+      .prepare(`SELECT * FROM entry_facet ${where} ORDER BY created DESC LIMIT ?`)
+      .all(...(params as string[])) as unknown as Record<string, unknown>[]
+    return rows.map(row => ({
+      id: String(row.id),
+      entryId: String(row.entry_id),
+      kind: row.kind as EntryFacet['kind'],
+      value: String(row.value),
+      raw: String(row.raw ?? ''),
+      ...row.from_ms === null ? {} : { fromMs: Number(row.from_ms) },
+      ...row.to_ms === null ? {} : { toMs: Number(row.to_ms) },
+      origin: String(row.origin),
+      state: row.state as EntryFacet['state'],
+      created: Number(row.created),
+    }))
   }
 
   /**
@@ -1466,18 +1722,21 @@ export class Store {
       salience?: number
       sessionId?: string
       tagPath?: string
+      extraTags?: readonly string[]
       confidence?: number
       /** 同上：省略 = 主树。 */
       treeId?: string
     } = {},
   ): { entry: MemoryEntry; superseded?: MemoryEntry } {
-    const tagPath = options.tagPath
-    const slot = tagPath === undefined || isCatchAll(tagPath) ? undefined : this.activeInSlot(tagPath)
-    const entry = this.add(text, options)
-    if (slot === undefined || slotMode() === 'keep') return { entry }
-    // `supersede` 只对 active 行生效：返回 false 说明旧值已被别人改过状态，
-    // 这时不报 superseded，免得审计里出现一笔没发生的取代
-    return this.supersede(slot.id, entry.id) ? { entry, superseded: slot } : { entry }
+    return this.withTx(() => {
+      const tagPath = options.tagPath
+      const slot = tagPath === undefined || isCatchAll(tagPath) ? undefined : this.activeInSlot(tagPath)
+      const entry = this.add(text, options)
+      if (slot === undefined || slotMode() === 'keep') return { entry }
+      // `supersede` 只对 active 行生效：返回 false 说明旧值已被别人改过状态，
+      // 这时不报 superseded，免得审计里出现一笔没发生的取代
+      return this.supersede(slot.id, entry.id) ? { entry, superseded: slot } : { entry }
+    })
   }
 
   /**
@@ -1542,34 +1801,85 @@ export class Store {
     options: { latestOnly?: boolean; history?: boolean } = {},
   ): MemoryEntry[] {
     const grams = bigrams(cue)
+    const lowerCue = cue.toLowerCase()
+    const now = Date.now()
+    const cueTime = parseTimeExpression(cue, now)
+    const reachable = this.reachableTrees()
     const scope = options.latestOnly === true
       ? "state = 'active'"
       : "state IN ('active', 'superseded')"
-    const rows = this.db.prepare(`SELECT m.*, t.path AS tag_path FROM memory_entry m LEFT JOIN tag t ON t.id = m.tag_id WHERE ${scope}`).all() as unknown as Row[]
-    const now = Date.now()
+    const rawRows = this.db.prepare(`
+      SELECT m.*, t.path AS tag_path, COALESCE(t.tree_id, 'main') AS tag_tree_id
+      FROM memory_entry m LEFT JOIN tag t ON t.id = m.tag_id
+      WHERE ${scope}
+    `).all() as unknown as Row[]
+    // 世界树 P-d：过滤掉未挂载子树中的记忆（tag_id 为空仍属于默认命名空间）
+    const rows = rawRows.filter(row => {
+      if (exclude.has(row.id)) return false
+      if (row.tag_id === null || row.tag_id === undefined) return true
+      return reachable.has(row.tag_tree_id ?? MAIN_TREE)
+    })
+    if (rows.length === 0) return []
+
+    // 世界树 P-e：批量读附加标签（仅限可达树）
+    const extraTagsByEntry = new Map<string, string[]>()
+    const etRows = this.db.prepare(`
+      SELECT et.entry_id, t.path, COALESCE(t.tree_id, 'main') AS tree_id
+      FROM entry_tag et JOIN tag t ON t.id = et.tag_id
+    `).all() as unknown as { entry_id: string; path: string; tree_id: string }[]
+    for (const et of etRows) {
+      if (!reachable.has(et.tree_id)) continue
+      const bucket = extraTagsByEntry.get(et.entry_id)
+      if (bucket === undefined) extraTagsByEntry.set(et.entry_id, [et.path])
+      else bucket.push(et.path)
+    }
+
+    // 索引化第 2 步（records/38）：批量读 active facets
+    const facetsByEntry = new Map<string, { kind: string; value: string; from_ms: number | null; to_ms: number | null }[]>()
+    const fRows = this.db.prepare(
+      "SELECT entry_id, kind, value, from_ms, to_ms FROM entry_facet WHERE state = 'active'",
+    ).all() as unknown as { entry_id: string; kind: string; value: string; from_ms: number | null; to_ms: number | null }[]
+    for (const f of fRows) {
+      const bucket = facetsByEntry.get(f.entry_id)
+      if (bucket === undefined) facetsByEntry.set(f.entry_id, [f])
+      else bucket.push(f)
+    }
 
     const candidates = rows
-      .filter(row => !exclude.has(row.id))
       .map(row => {
-        // 通道一（词）：线索与正文的二元组重叠
+        // 通道一（词）：线索与正文的二元组重叠（不拼入 id，避免随机 id 字符误命中）
         let hits = 0
-        for (const gram of bigrams(`${row.text}${row.id}`)) if (grams.has(gram)) hits += 1
-        // 通道二（标签）：线索包含任一标签段（受控词表，≤7 字）即命中。
-        // 标签是主题的受控命名，比任意正文稳定——「住在哪个城市」命中不了
-        // 「我搬到北京了」的正文，但能命中 `记忆/用户/城市` 的标签段。
+        for (const gram of bigrams(row.text)) if (grams.has(gram)) hits += 1
+        // 通道二（标签：主标签 + 附加标签 `entry_tag`，P-e）：线索包含任一标签段即命中
         let tagHit = false
-        if (row.tag_path !== null) {
-          for (const segment of row.tag_path.split('/')) {
-            if (segment !== ROOT_TAG && segment.length >= 2 && cue.includes(segment)) {
+        const allPaths = new Set<string>(extraTagsByEntry.get(row.id) ?? [])
+        if (row.tag_path !== null) allPaths.add(row.tag_path)
+        for (const path of allPaths) {
+          for (const segment of path.split('/')) {
+            if (segment !== ROOT_TAG && segment.length >= 2 && lowerCue.includes(segment.toLowerCase())) {
               tagHit = true
               break
             }
           }
+          if (tagHit) break
         }
-        return { row, hits, tagHit }
+        // 通道三（索引化 facet：cue / entity 取 1.0，时间区间重叠取 0.6）
+        let facetRel = 0
+        for (const f of facetsByEntry.get(row.id) ?? []) {
+          if ((f.kind === 'cue' || f.kind === 'entity') && f.value !== '' && lowerCue.includes(f.value)) {
+            facetRel = 1.0
+            break
+          }
+          if (f.kind === 'time' && cueTime !== undefined && f.from_ms !== null && f.to_ms !== null) {
+            if (overlaps(cueTime, { start: Number(f.from_ms), end: Number(f.to_ms) })) {
+              facetRel = Math.max(facetRel, 0.6)
+            }
+          }
+        }
+        return { row, hits, tagHit, facetRel }
       })
-      // 双通道任一命中即入围；零重叠不再一票否决
-      .filter(item => item.hits > 0 || item.tagHit)
+      // 三通道任一命中即入围；零重叠不再一票否决
+      .filter(item => item.hits > 0 || item.tagHit || item.facetRel > 0)
 
     if (candidates.length === 0) return []
     const maxHits = Math.max(...candidates.map(item => item.hits))
@@ -1578,15 +1888,16 @@ export class Store {
     const taint = this.taintMap()
 
     const ranked = candidates
-      .map(({ row, hits, tagHit }) => {
-        // 结构命中（标签）是比字面重叠更强的信号，直接给满相关度
-        const relevance = Math.max(hits / maxHits, tagHit ? 1 : 0)
+      .map(({ row, hits, tagHit, facetRel }) => {
+        const wordRel = maxHits > 0 ? hits / maxHits : 0
+        // 结构命中（标签 / 线索 / 实体）给满相关度 1.0；时间区间给 0.6 并参与排序破平
+        const relevance = Math.max(wordRel, tagHit ? 1 : 0, facetRel)
         const trust = Math.min(row.trust, taint.get(row.id) ?? row.trust)
         const score = relevance * row.salience * trust
-        return { row, score, salience: row.salience, trust }
+        return { row, score, salience: row.salience, trust, facetRel }
       })
       .filter(item => item.salience >= MIN_SALIENCE && item.trust >= MIN_TRUST)
-      .sort((left, right) => right.score - left.score)
+      .sort((left, right) => right.score - left.score || right.facetRel - left.facetRel)
 
     // 同槽只出一条：叶=槽，槽内取**现值**（`01` §5.4.1）。
     // 默认检索会带上 `superseded` 的旧值（历史常有用），所以不能只按分数取第一条：
@@ -1641,7 +1952,13 @@ export class Store {
         return bestInSlot.get(leaf) === index || historyInSlot.get(leaf) === index
       })
       .slice(0, limit)
-      .map(item => toEntry(item.row))
+      .map(item => {
+        const entry = toEntry(item.row)
+        if (item.row.tag_id !== null && item.row.tag_id !== undefined && (item.row.tag_tree_id ?? MAIN_TREE) !== MAIN_TREE) {
+          entry.tag = this.globalPathOf(item.row.tag_id) ?? entry.tag
+        }
+        return entry
+      })
   }
 
   /**
@@ -1720,6 +2037,7 @@ export class Store {
    * @returns 叶子标签 id；路径不合法或超限时为 undefined。
    */
   ensureTag(rawPath: string, treeId: string = MAIN_TREE): string | undefined {
+    if (treeId !== MAIN_TREE && this.isTreeReadonly(treeId)) return undefined
     // 树的根名决定前缀（`09` §8）：主树是「记忆」，子树是它自己的名字。
     // 树不存在就拒绝——**不自动建树**，与"父级不自动创建"同一条理由（记录 10）。
     const rootName = treeId === MAIN_TREE ? ROOT_TAG : this.treeName(treeId)
@@ -2860,8 +3178,8 @@ export class Store {
     }
   }
 
-  /** 全部归档指针，时间正序（供分阶段下钻）。 */
-  archiveRefs(limit = 500): { turnTs: number; title: string; chars: number; sessionFile: string }[] {
+  /** 全部归档指针（默认上限 5000，供分阶段下钻）。 */
+  archiveRefs(limit = 5000): { turnTs: number; title: string; chars: number; sessionFile: string }[] {
     const rows = this.db
       .prepare('SELECT turn_ts, title, chars, session_file FROM archive_pointer ORDER BY turn_ts DESC LIMIT ?')
       .all(limit) as unknown as { turn_ts: number; title: string; chars: number; session_file: string }[]
@@ -2905,17 +3223,43 @@ export class Store {
    * @param kind - 事件类型（as/injection、as/redaction…）。
    * @param data - 结构化内容。
    */
+  /**
+   * 原子写事务封装（支持同实例重入，仅最外层开闭 BEGIN IMMEDIATE）。
+   * 配合 `PRAGMA busy_timeout`，确保多进程并发写审计链与同槽取代不争抢。
+   */
+  private withTx<T>(fn: () => T): T {
+    if (this.txDepth > 0) return fn()
+    this.db.exec('BEGIN IMMEDIATE')
+    this.txDepth += 1
+    try {
+      const value = fn()
+      this.db.exec('COMMIT')
+      return value
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {
+        // 已回滚则忽略
+      }
+      throw error
+    } finally {
+      this.txDepth -= 1
+    }
+  }
+
   private writeAudit(kind: string, data: unknown): void {
-    const last = this.db.prepare('SELECT hash FROM audit_chain ORDER BY seq DESC LIMIT 1').get() as unknown as
-      | { hash: string }
-      | undefined
-    const prev = last?.hash ?? 'genesis'
-    const at = Date.now()
-    const payload = JSON.stringify(scrubDeep(data ?? {}) ?? {})
-    const hash = createHmac('sha256', this.auditKey()).update(`${prev}|${kind}|${payload}|${at}`).digest('hex')
-    this.db
-      .prepare('INSERT INTO audit_chain (at, kind, data, prev, hash) VALUES (?, ?, ?, ?, ?)')
-      .run(at, kind, payload, prev, hash)
+    this.withTx(() => {
+      const last = this.db.prepare('SELECT hash FROM audit_chain ORDER BY seq DESC LIMIT 1').get() as unknown as
+        | { hash: string }
+        | undefined
+      const prev = last?.hash ?? 'genesis'
+      const at = Date.now()
+      const payload = JSON.stringify(scrubDeep(data ?? {}) ?? {})
+      const hash = createHmac('sha256', this.auditKey()).update(`${prev}|${kind}|${payload}|${at}`).digest('hex')
+      this.db
+        .prepare('INSERT INTO audit_chain (at, kind, data, prev, hash) VALUES (?, ?, ?, ?, ?)')
+        .run(at, kind, payload, prev, hash)
+    })
   }
 
   /**
@@ -3067,7 +3411,7 @@ export class Store {
    * @param cue - 线索（自然语言）。
    * @param limit - 最多几条。
    */
-  searchArchive(cue: string, limit = 3): { turnTs: number; title: string; summary: string; sessionFile: string; score: number }[] {
+  searchArchive(cue: string, limit = 3, scanLimit = 2000): { turnTs: number; title: string; summary: string; sessionFile: string; score: number }[] {
     // 中文没有空格：拉丁词按空格切，CJK 用二元组（与召回同一套口径）
     const lower = cue.toLowerCase()
     const words = [
@@ -3082,8 +3426,8 @@ export class Store {
       })(),
     ]
     const rows = this.db
-      .prepare("SELECT turn_ts, title, summary, session_file FROM archive_pointer WHERE summary <> '' ORDER BY turn_ts DESC LIMIT 500")
-      .all() as unknown as { turn_ts: number; title: string; summary: string; session_file: string }[]
+      .prepare("SELECT turn_ts, title, summary, session_file FROM archive_pointer WHERE summary <> '' ORDER BY turn_ts DESC LIMIT ?")
+      .all(scanLimit) as unknown as { turn_ts: number; title: string; summary: string; session_file: string }[]
     return rows
       .map(row => {
         const haystack = `${row.title}\n${row.summary}`.toLowerCase()

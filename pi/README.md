@@ -30,7 +30,7 @@ pi 的约定（`pi` 自己的 `docs/extensions.md`）：`<agent-dir>/extensions/
 只要有 `index.ts` 入口就会被自动加载；`<agent-dir>` 默认是 `~/.pi/agent`，
 可用 `PI_CODING_AGENT_DIR` 改。本包是多文件实现，正好走"目录"形态。
 
-仓库里带了一个部署脚本（Windows / Git Bash）：
+仓库里带了一个部署脚本（Windows / Git Bash 与 macOS / Linux POSIX 终端）：
 
 ```sh
 bash pi/scripts/deploy.sh --with-env
@@ -51,7 +51,7 @@ bash pi/scripts/deploy.sh --with-env
 |---|---|
 | 只更新文件 | `bash pi/scripts/deploy.sh` |
 | 顺带配环境变量 | `bash pi/scripts/deploy.sh --with-env` |
-| 再打开写能力分级的严格闸 | `bash pi/scripts/deploy.sh --with-env --capability` |
+| 显式写严格闸变量 | `bash pi/scripts/deploy.sh --with-env --capability`（现已默认开启） |
 | 卸掉 | 删掉 `<agent-dir>/extensions/authentic-self/` 目录即可 |
 
 ### 方式二：临时加载（试一下）
@@ -104,7 +104,7 @@ AS_BYPASS_MODEL=deepseek-chat
 |---|---|---|
 | `AS_ENABLED` | 关 | 总开关，`1` 才启用 |
 | `AS_DB` | `$PI_HOME/agent/authentic-self/memory.db`（`PI_HOME` 未设则 `~/.pi`） | 记忆库文件路径 |
-| `AS_PROFILE` | — | 换 profile = 换一套库（`profiles/<name>/memory.db`）；名字里的路径分隔符会被剥掉 |
+| `AS_PROFILE` | — | 换 profile = 换一套库（`profiles/<name>/memory.db`）；路径分隔符会被剥掉，纯 `.` / `..` 串会拒绝逃逸 |
 | `AS_VIEW` | — | `=1` 起本地上下文组成页（只读、只绑 127.0.0.1，默认关闭） |
 | `AS_VIEW_PORT` | `4787` | 查看页端口 |
 | `AS_VIEW_SNAPSHOT` | — | 给一个 `.html` 路径，会话结束导出可离线打开的快照 |
@@ -117,7 +117,7 @@ AS_BYPASS_MODEL=deepseek-chat
 | `AS_SALIENCE` | 开 | `0` 退回旧的**批量降权**口径（`salience × 0.85`）；默认走**评分模型**（按证据算绝对分，幂等、可解释）。两者改同一列，**只能二选一** |
 | `AS_TOOL` | 开 | `0` 不注册 `memory` 工具（模型只能用自然语言交涉；`change` 与 `archive` 仍可用） |
 | `AS_COMPACT` | 关 | `1` 启用宿主 `ctx.compact()` 兜底；默认关闭（由按轮折叠/压缩自己处理） |
-| `AS_CAPABILITY` | 关 | `=1` 打开写能力分级的**严格闸**：未走作用域的写调用一律拒绝并记 `as/capability_denied`。**默认关 = 今天的行为一字不变**；开着时若哪处漏接，当场抛错而不是悄悄通过 |
+| `AS_CAPABILITY` | **开** | 写能力分级的**严格闸**：未走作用域的写调用一律拒绝并记 `as/capability_denied`；设 `0` 可临时退回宽松直调 |
 | `AS_DEBUG` | 关 | `1` 往 stderr 打点；`AS_TRACE=1` 落 `%TEMP%/as-trace.log` |
 
 其余调优项（折叠、按轮批量、冷却、各旁路超时）见仓库文档的那张完整表。
@@ -150,8 +150,11 @@ AS_BYPASS_MODEL=deepseek-chat
 | `/as-adopt <id>` | 批准一条积压，入 `memory_entry` |
 | `/as-dismiss <id>` | 无视一条积压（不入库） |
 | `/as-adopt-all [来源]` / `/as-dismiss-all [来源]` | 按来源整批处置积压（不带参数=全部） |
-| `/as-profile [名字]` | 显示当前 profile 与库路径；切换 profile 要新起会话（运行中换库会把审计链切成两段） |
+| `/as-profile [名字]` | 只读枚举 `profiles/` 条数与链健康状态；带名核对库存在性与启动命令（不运行中热切） |
 | `/as-scrub-scan` | 脱敏体检：列出库里仍残留明文凭据的条目（**只读**，预览也是脱敏的） |
+| `/as-tree [create <名>]` | 查看所有世界树、可达性与挂载位置；带 `create` 建新子树根 |
+| `/as-mount [attach\|detach ...]` | 挂载子树到全局父路径（可选 `readonly`）或卸载子树（只删关系，不删内容） |
+| `/as-facet [list\|proposed\|add\|approve\|dismiss]` | 管理条目线索/实体/时间索引，或审核维护旁路提交的 `ENTITY` 提案 |
 
 不受信任时**挡**的是"内容写入 + 共享结构改动"：三处记忆写入（收尾沉淀 / 维护补记 / `REVISE`）入队；维护旁路的 `merge` / `supersede` 与标签创建、标签树整理整段跳过。**放行**读、对话、剔除、权重（`touch` / `decay`）、计划区与压缩标记。
 
@@ -182,12 +185,12 @@ AS_BYPASS_MODEL=deepseek-chat
 
 ## 现状
 
-- **22 个 TS 模块、9,740 行，无构建系统**（宿主直接加载 TS，所以本包没有 `build` 脚本）。
-- **22 个测试脚本（3,631 行）全过**；`tsc` 只剩 2 条基线错误（宿主 1.3.0 vs 1.4.0 的 API 差，与代码无关）。
+- **26 个 TS 模块、10,431 行，无构建系统**（宿主直接加载 TS，所以本包没有 `build` 脚本；附 [`tsconfig.json`](tsconfig.json) 供 `npm run typecheck`）。
+- **24 个测试脚本（4,443 行）全过**（含对 `index.ts` 核心钩子的 Mock 集成回归）。
 - **真会话已跑过多次**：写入 → 注入 → 召回 → 压缩 → 归档取回的全链都验过
   （证据见 `../docs/records/` 的 29 / 42 / 43 / 45 / 50 等）。
 - 钩子是 pi `1.x` 才齐的，低版本宿主可能根本没有；**Aether 上尚未验证**（它 README 写 pi 0.85.1）。
-- 世界树（标签树）正在按 `../docs/09-world-tree.md` 分期改造：P-a/b/c 已落地，**P-d 起未开工**。
+- 世界树（标签树）按 `../docs/09-world-tree.md` 演进：P-a–e 已落地（`entry_tag` 附加标签召回、多树挂载、可达树过滤、全局路径与嵌套挂载），**P-f/g/h 待后续按需推进**。
 
 ## 自测
 
@@ -196,7 +199,7 @@ cd pi
 npm test
 ```
 
-串跑 `test/*.test.mjs`（当前共 22 个测试文件、3,631 行，详细清单见 `../docs/04-implementation.md`），任一失败即非零退出。等价的手写命令（bash）：
+串跑 `test/*.test.mjs`（当前共 24 个测试文件、4,443 行，详细清单见 `../docs/04-implementation.md`），任一失败即非零退出。等价的手写命令（bash）：
 
 ```sh
 for f in test/*.test.mjs; do node --experimental-strip-types --no-warnings "$f" || exit 1; done

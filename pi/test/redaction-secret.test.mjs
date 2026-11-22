@@ -31,7 +31,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 1. reason 含密钥 → 落库前消毒，库里没有明文 ────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const id = s.addRedaction('部署用的访问令牌是', `这个片段里含明文凭证值 ${SK}，注入会把密钥带进上下文`)
   check('1a 登记成功', id !== undefined, String(id))
 
@@ -47,7 +47,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 2. find_text 含密钥 → 保持原样（匹配不能坏），但记 raw risk 审计 ────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const id = s.addRedaction(`明文密钥 ${SK}`, '模型直接拿密钥当剔除片段')
   const row = s.db.prepare('SELECT find_text FROM redaction WHERE id = ?').get(id)
   check('2a find_text 保持逐字原样（匹配功能不坏）', row.find_text.includes(SK), row.find_text)
@@ -63,7 +63,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 3. replace_text 含密钥 → 同上（保持原样 + raw risk 审计）─────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const id = s.addRedaction('普通片段', '正常理由', { replace: `替换成 ${SK}` })
   const row = s.db.prepare('SELECT replace_text FROM redaction WHERE id = ?').get(id)
   check('3a replace_text 保持逐字原样', row.replace_text.includes(SK), row.replace_text)
@@ -74,7 +74,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 4. 普通剔除 → 行为与今天完全一致 ──────────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const id = s.addRedaction('部署用的访问令牌是', '这里含个人隐私')
   const row = s.db.prepare('SELECT find_text, replace_text, reason FROM redaction WHERE id = ?').get(id)
   check('4a reason 原样（不含凭据就不动它）', row.reason === '这里含个人隐私', row.reason)
@@ -89,7 +89,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
   const once = scrubSecrets(`含 ${SK} 的理由`).text
   const twice = scrubSecrets(once).text
   check('5a 二次消毒不变（幂等）', twice === once, twice)
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const id = s.addRedaction('普通片段', once)
   const row = s.db.prepare('SELECT reason FROM redaction WHERE id = ?').get(id)
   check('5b 已消毒的 reason 落库后不变', row.reason === once, row.reason)
@@ -97,7 +97,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 6. appendAudit：文本字段被消毒，结构字段原样不动 ───────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.appendAudit('as/probe', {
     id: 'm-abc123',
     count: 3,
@@ -122,7 +122,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 7. 审计链完整性不受影响（hash 仍能验）────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.appendAudit('as/probe', { reason: `含 ${SK}` })
   s.appendAudit('as/probe2', { count: 1 })
   const check1 = s.verifyAudit()
@@ -132,7 +132,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 8. redactionAudit()：给调用方的净化视图 ────────────────────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   const id = s.addRedaction('部署用的访问令牌是', `含 ${SK} 的理由`)
   const view = s.redactionAudit(id)
   check('8a 返回净化后的记录', view !== undefined && !view.reason.includes(SK), JSON.stringify(view))
@@ -154,7 +154,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
     ['base64', HEXY],
   ]
   for (const [kind, secret] of cases) {
-    const s = new Store(':memory:')
+    const s = new Store(':memory:', { strict: false })
     const id = s.addRedaction('普通片段', `理由里含 ${secret} 这类东西`)
     const row = s.db.prepare('SELECT reason FROM redaction WHERE id = ?').get(id)
     check(`9 ${kind} 在 reason 里被消毒`, !row.reason.includes(secret), row.reason)
@@ -166,7 +166,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 // ── 10. 其余"模型写的自由文本"落库路径也过一遍消毒 ────────────────────────
 {
   // 计划区（模型写、每次请求都注入一次）
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.savePlan('/tmp/sess.jsonl', `目标含 ${SK}`, [`步骤一：用 ${SK}`], `开放问题 ${SK}`)
   const plan = s.getPlan('/tmp/sess.jsonl')
   check('10a 计划目标被消毒', !plan.goal.includes(SK), plan.goal)
@@ -174,27 +174,27 @@ const HEXY = 'aB3dE5f7'.repeat(4)
   check('10c 计划的开放问题被消毒', !plan.openQuestions.includes(SK), plan.openQuestions)
 
   // 转存判断的理由（模型写的自由文本）
-  const s2 = new Store(':memory:')
+  const s2 = new Store(':memory:', { strict: false })
   const entry = s2.add('一条长一点的内容需要判转存', { origin: 'model' })
   s2.setDocVerdict(entry.id, 'doc', `理由里含 ${SK}`)
   const doc = s2.list().find(item => item.id === entry.id)
   check('10d 转存理由被消毒', !doc.docReason.includes(SK), doc.docReason)
 
   // 轮次标记的理由（维护旁路写的）
-  const s3 = new Store(':memory:')
+  const s3 = new Store(':memory:', { strict: false })
   s3.markTurn(1234, `标记理由含 ${SK}`)
   const mark = s3.db.prepare('SELECT reason FROM turn_mark WHERE anchor_ts = ?').get(1234)
   check('10e 轮次标记理由被消毒', !mark.reason.includes(SK), mark.reason)
 
   // 归档指针的标题与摘要（压缩旁路转述，且会被 searchArchive 捞回给模型）
-  const s4 = new Store(':memory:')
+  const s4 = new Store(':memory:', { strict: false })
   s4.addArchiveRefs([{ turn: 1, timestamp: 100, title: `标题含 ${SK}`, chars: 20, summary: `摘要含 Bearer ${TOKEN}` }], '/tmp/sess.jsonl')
   const ptr = s4.db.prepare('SELECT title, summary FROM archive_pointer WHERE session_file = ?').get('/tmp/sess.jsonl')
   check('10f 归档标题被消毒', !ptr.title.includes(SK), ptr.title)
   check('10g 归档摘要被消毒', !ptr.summary.includes(TOKEN), ptr.summary)
 
   // 大改申请的理由与反思（模型写的说明文字）
-  const s5 = new Store(':memory:')
+  const s5 = new Store(':memory:', { strict: false })
   const anchorId = s5.addAnchor('身份叙述', { origin: 'human' })
   const changeId = s5.addChange({
     kind: 'l1',
@@ -210,7 +210,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
   check('10j 大改的归一文本被消毒', !change.normalized.includes(SK), change.normalized)
 
   // 积压队列的**理由**（模型写的说明文字）
-  const s6 = new Store(':memory:')
+  const s6 = new Store(':memory:', { strict: false })
   s6.enqueueWrite({ sessionFile: '/tmp/u.jsonl', text: '想记住的一件事', origin: 'model', reason: `理由含 ${SK}` })
   const queued = s6.listPendingWrites('/tmp/u.jsonl')[0]
   check('10k 积压理由被消毒', !queued.reason.includes(SK), queued.reason)
@@ -219,7 +219,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 11. 刻意不脱敏的三处（记录 31 §三 的不对称，被断言守住）────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   // 备注：人写的原话（人自己搜得到自己写的东西）
   s.addNote('sess-1', `注脚里写了 ${SK}`)
   check('11a 备注保持原样（人写的原话）', s.listNotes().some(note => note.text.includes(SK)))
@@ -242,7 +242,7 @@ const HEXY = 'aB3dE5f7'.repeat(4)
 
 // ── 12. 剔除功能本身没被弄坏（find 必须逐字，否则匹配失效）────────────────
 {
-  const s = new Store(':memory:')
+  const s = new Store(':memory:', { strict: false })
   s.addRedaction('部署用的访问令牌是', '个人隐私')
   // 用库里那份**逐字原文**去剔除——这正是 `applyRedactions` 的用法
   const rules = s.redactions('')
@@ -255,11 +255,16 @@ const HEXY = 'aB3dE5f7'.repeat(4)
   check('12b 命中计数正确', view.hits === 1, String(view.hits))
 
   // find 本身含密钥时：库里保持逐字（匹配要精确），但视图里那条会被遮掉
-  const s2 = new Store(':memory:')
+  const s2 = new Store(':memory:', { strict: false })
   s2.addRedaction(`明文密钥 ${SK}`, '模型直接拿密钥当片段')
   const view2 = applyRedactions([{ role: 'user', content: `明文密钥 ${SK}` }], s2.redactions(''))
   check('12c find 含密钥时仍能精确匹配并遮住',
     view2.hits === 1 && !view2.messages[0].content.includes(SK), JSON.stringify(view2.messages[0].content))
+  check('12d touchedIndices 精确记录被改动的消息下标',
+    Array.isArray(view2.touchedIndices) && view2.touchedIndices.length === 1 && view2.touchedIndices[0] === 0,
+    JSON.stringify(view2.touchedIndices))
+  const untouched = applyRedactions([{ role: 'user', content: '完全无关的句子' }], rules)
+  check('12e 未命中时 touchedIndices 为空数组', untouched.hits === 0 && untouched.touchedIndices.length === 0)
 }
 
 const failed = results.filter(item => !item.ok)
